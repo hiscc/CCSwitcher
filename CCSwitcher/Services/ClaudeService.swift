@@ -104,6 +104,113 @@ final class ClaudeService: Sendable {
         return accessToken
     }
 
+    /// Check if a token JSON's accessToken is expired (or will expire within the grace period).
+    static func isTokenExpired(_ tokenJSON: String, graceSeconds: TimeInterval = 300) -> Bool {
+        guard let data = tokenJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any] else {
+            log.warning("[isTokenExpired] Failed to parse token JSON — treating as expired")
+            return true
+        }
+        // expiresAt may be Int or Double depending on JSON source
+        let expiresAt: Double
+        if let d = oauth["expiresAt"] as? Double {
+            expiresAt = d
+        } else if let i = oauth["expiresAt"] as? Int {
+            expiresAt = Double(i)
+        } else if let n = oauth["expiresAt"] as? NSNumber {
+            expiresAt = n.doubleValue
+        } else {
+            log.warning("[isTokenExpired] No expiresAt field — treating as expired")
+            return true
+        }
+        let expiryDate = Date(timeIntervalSince1970: expiresAt / 1000.0)
+        let remaining = expiryDate.timeIntervalSinceNow
+        let isExpired = remaining < graceSeconds
+        log.info("[isTokenExpired] Expires at \(expiryDate), remaining=\(Int(remaining))s, expired=\(isExpired)")
+        return isExpired
+    }
+
+    /// Extract refreshToken from a token JSON.
+    static func extractRefreshToken(from tokenJSON: String) -> String? {
+        guard let data = tokenJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let refreshToken = oauth["refreshToken"] as? String else {
+            return nil
+        }
+        return refreshToken
+    }
+
+    // MARK: - Token Refresh
+
+    private static let oauthTokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+    private static let oauthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+    /// Refresh an expired accessToken using the refreshToken via Anthropic's OAuth endpoint.
+    /// Returns the updated token JSON string, or nil on failure.
+    func refreshAccessToken(tokenJSON: String) async -> String? {
+        guard let refreshToken = Self.extractRefreshToken(from: tokenJSON) else {
+            log.error("[refreshToken] No refreshToken in token JSON")
+            return nil
+        }
+        log.info("[refreshToken] Refreshing via \(Self.oauthTokenURL.absoluteString)...")
+
+        var request = URLRequest(url: Self.oauthTokenURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("claude-code/1.0", forHTTPHeaderField: "User-Agent")
+
+        let body: [String: String] = [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": Self.oauthClientId
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                log.error("[refreshToken] No HTTP response")
+                return nil
+            }
+            guard http.statusCode == 200 else {
+                let resp = String(data: data, encoding: .utf8) ?? ""
+                log.error("[refreshToken] HTTP \(http.statusCode): \(resp.prefix(200))")
+                return nil
+            }
+            guard let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let newAccessToken = result["access_token"] as? String,
+                  let expiresIn = result["expires_in"] as? Double else {
+                log.error("[refreshToken] Failed to parse response")
+                return nil
+            }
+
+            // Rebuild token JSON with new values
+            guard var tokenDict = try? JSONSerialization.jsonObject(
+                        with: tokenJSON.data(using: .utf8)!) as? [String: Any],
+                  var oauth = tokenDict["claudeAiOauth"] as? [String: Any] else {
+                return nil
+            }
+            oauth["accessToken"] = newAccessToken
+            oauth["expiresAt"] = Int((Date().timeIntervalSince1970 + expiresIn) * 1000.0)
+            if let newRefresh = result["refresh_token"] as? String {
+                oauth["refreshToken"] = newRefresh
+            }
+            tokenDict["claudeAiOauth"] = oauth
+
+            guard let newData = try? JSONSerialization.data(withJSONObject: tokenDict),
+                  let newJSON = String(data: newData, encoding: .utf8) else {
+                return nil
+            }
+            log.info("[refreshToken] Success! Expires in \(Int(expiresIn/3600))h")
+            return newJSON
+        } catch {
+            log.error("[refreshToken] Network error: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     // MARK: - Account Switching
 
     func switchAccount(from currentAccount: Account, to targetAccount: Account) async throws {

@@ -19,6 +19,12 @@
 - 新增 Cancel 按钮允许用户取消等待，支持 Task cancellation
 - `loginNewAccount()` 增加重入保护
 
+### fix: Token 过期自动检测与预防
+- 新增 `isTokenExpired()` 本地检查 accessToken 的 expiresAt 字段（兼容 Int/Double/NSNumber）
+- 切换账号时如果目标 token 已过期，自动转为 re-auth 流程（打开浏览器重新登录），而不是用死 token 切换后报 401
+- 获取用量时预检查非活跃账号 token 过期，直接标记 "Token expired" 并跳过 API 调用
+- 自动切换排除 token 过期的账号
+
 ### fix: 全面健壮性审计修复
 - **账号切换回滚**：`switchAccount` oauthAccount 写入失败时自动回滚已写入的 token
 - **Keychain 并发安全**：backup store 的 load-modify-save 加 NSLock 保护

@@ -344,10 +344,29 @@ final class AppState: ObservableObject {
         log.info("[switchTo] ===== Switching from \(currentActive.email) to \(account.email) =====")
 
         // Pre-switch: verify target has a backup
-        guard keychain.getAccountBackup(forAccountId: account.id.uuidString) != nil else {
+        guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) else {
             log.error("[switchTo] ABORT: no backup for target account")
             errorMessage = "No stored credentials for \(account.email). Use re-authenticate to fix."
             return
+        }
+
+        // If token is expired, try auto-refresh first; fall back to re-auth only if refresh fails
+        if ClaudeService.isTokenExpired(backup.token) {
+            log.warning("[switchTo] Target token expired for \(account.email), attempting auto-refresh...")
+            if let refreshedJSON = await claudeService.refreshAccessToken(tokenJSON: backup.token) {
+                log.info("[switchTo] Token refreshed for \(account.email), updating backup and proceeding")
+                keychain.saveAccountBackup(
+                    token: refreshedJSON,
+                    oauthAccount: backup.oauthAccount,
+                    forAccountId: account.id.uuidString
+                )
+                // Continue with the switch using refreshed token (don't return)
+            } else {
+                log.warning("[switchTo] Auto-refresh failed for \(account.email), falling back to re-auth")
+                errorMessage = "Token expired for \(account.email). Re-authenticating..."
+                await reauthenticateAccount(account)
+                return
+            }
         }
 
         isLoading = true
@@ -515,12 +534,34 @@ final class AppState: ObservableObject {
     private func fetchAllAccountUsage() async {
         accountUsageErrors.removeAll()
         for account in accounts {
-            let tokenJSON: String?
+            var tokenJSON: String?
             if account.isActive {
                 tokenJSON = keychain.readClaudeToken()
             } else {
                 tokenJSON = keychain.getAccountBackup(forAccountId: account.id.uuidString)?.token
             }
+
+            // Pre-check token expiry for non-active accounts — try auto-refresh before giving up
+            if let tj = tokenJSON, !account.isActive, ClaudeService.isTokenExpired(tj) {
+                log.info("[fetchUsage] Token expired locally for \(account.email), attempting auto-refresh...")
+                if let refreshedJSON = await claudeService.refreshAccessToken(tokenJSON: tj) {
+                    log.info("[fetchUsage] Token refreshed for \(account.email)")
+                    if let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) {
+                        keychain.saveAccountBackup(
+                            token: refreshedJSON,
+                            oauthAccount: backup.oauthAccount,
+                            forAccountId: account.id.uuidString
+                        )
+                    }
+                    tokenJSON = refreshedJSON
+                } else {
+                    log.warning("[fetchUsage] Auto-refresh failed for \(account.email), marking as expired")
+                    fallbackToCache(for: account.id)
+                    accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: "Token expired. Click ↻ to re-authenticate.")
+                    continue
+                }
+            }
+
             guard let tokenJSON, let accessToken = ClaudeService.extractAccessToken(from: tokenJSON) else {
                 log.warning("[fetchUsage] No token for \(account.email), skipping")
                 continue
@@ -536,37 +577,33 @@ final class AppState: ObservableObject {
                 accountUsageErrors[account.id] = nil
                 log.info("[fetchUsage] \(account.email): session=\(usage.fiveHour?.utilization ?? -1)%, weekly=\(usage.sevenDay?.utilization ?? -1)%")
             } catch ClaudeService.UsageError.expired {
-                log.warning("[fetchUsage] Token expired for \(account.email)")
-                if account.isActive {
-                    // Try refreshing via CLI: run `auth status` which may internally refresh the token
-                    var recovered = false
-                    do {
-                        _ = try await claudeService.getAuthStatus()
-                        log.info("[fetchUsage] Auth status check done for active account.")
-                        if let refreshedJSON = keychain.readClaudeToken(),
-                           let refreshedToken = ClaudeService.extractAccessToken(from: refreshedJSON),
-                           refreshedToken != accessToken,
-                           let usage = try? await claudeService.getUsageLimits(accessToken: refreshedToken) {
-                            accountUsage[account.id] = usage
-                            cachedUsage[account.id] = CachedUsageEntry(usage: usage, fetchedAt: Date())
-                            accountUsageErrors[account.id] = nil
-                            // Update backup with the refreshed token
-                            _ = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString)
-                            log.info("[fetchUsage] Recovered \(account.email) via token refresh.")
-                            recovered = true
-                        }
-                    } catch {
-                        log.error("[fetchUsage] Auth status check failed: \(error.localizedDescription)")
+                log.warning("[fetchUsage] 401 expired for \(account.email), attempting auto-refresh...")
+                let currentTokenJSON = account.isActive ? keychain.readClaudeToken() : tokenJSON
+                var recovered = false
+                if let tj = currentTokenJSON,
+                   let refreshedJSON = await claudeService.refreshAccessToken(tokenJSON: tj) {
+                    log.info("[fetchUsage] Token refreshed for \(account.email)")
+                    // Save refreshed token
+                    if account.isActive {
+                        keychain.writeClaudeToken(refreshedJSON)
+                        _ = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString)
+                    } else if let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) {
+                        keychain.saveAccountBackup(token: refreshedJSON, oauthAccount: backup.oauthAccount, forAccountId: account.id.uuidString)
                     }
-                    if !recovered {
-                        log.warning("[fetchUsage] Could not refresh token for active account \(account.email)")
-                        fallbackToCache(for: account.id)
-                        accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: "Token expired. Click ↻ to re-authenticate.")
+                    // Retry with new token
+                    if let newToken = ClaudeService.extractAccessToken(from: refreshedJSON),
+                       let usage = try? await claudeService.getUsageLimits(accessToken: newToken) {
+                        accountUsage[account.id] = usage
+                        cachedUsage[account.id] = CachedUsageEntry(usage: usage, fetchedAt: Date())
+                        accountUsageErrors[account.id] = nil
+                        log.info("[fetchUsage] Recovered \(account.email) via auto-refresh.")
+                        recovered = true
                     }
-                } else {
-                    log.info("[fetchUsage] Non-active account \(account.email) token expired.")
+                }
+                if !recovered {
+                    log.warning("[fetchUsage] Auto-refresh failed for \(account.email)")
                     fallbackToCache(for: account.id)
-                    accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: "Token expired. Switch to refresh.")
+                    accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: "Token expired. Click ↻ to re-authenticate.")
                 }
             } catch {
                 log.error("[fetchUsage] Failed to get usage for \(account.email): \(error.localizedDescription)")
