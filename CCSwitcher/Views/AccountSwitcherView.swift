@@ -107,7 +107,7 @@ struct AccountSwitcherView: View {
             .help("Re-authenticate (fix stale token)")
 
             Button {
-                appState.removeAccount(account)
+                Task { await appState.removeAccount(account) }
             } label: {
                 Image(systemName: "trash")
                     .font(.caption)
@@ -140,6 +140,11 @@ struct AccountSwitcherView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
+                Button("Cancel") {
+                    appState.cancelLogin()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
             }
             .frame(maxWidth: .infinity)
             .padding(12)
@@ -182,7 +187,7 @@ struct AccountSwitcherView: View {
             VStack(spacing: 8) {
                 // Primary: Login new account via browser
                 Button {
-                    Task { await appState.loginNewAccount() }
+                    appState.loginTask = Task { await appState.loginNewAccount() }
                 } label: {
                     Label("Login New Account", systemImage: "person.badge.plus")
                         .font(.subheadline)

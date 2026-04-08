@@ -22,6 +22,8 @@ private final class FileLogWriter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.ccswitcher.filelog")
     private let dateFormatter: ISO8601DateFormatter
 
+    private static let maxLogSize: UInt64 = 2 * 1024 * 1024 // 2 MB
+
     init() {
         let logsDir = NSHomeDirectory() + "/Library/Logs"
         let path = logsDir + "/CCSwitcher.log"
@@ -29,12 +31,24 @@ private final class FileLogWriter: @unchecked Sendable {
         dateFormatter = ISO8601DateFormatter()
         dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
-        // Truncate on launch so we always see the current session
-        FileManager.default.createFile(atPath: path, contents: nil)
+        // Rotate log if it exceeds max size
+        let fm = FileManager.default
+        if let attrs = try? fm.attributesOfItem(atPath: path),
+           let size = attrs[.size] as? UInt64, size > Self.maxLogSize {
+            let oldPath = logsDir + "/CCSwitcher.log.old"
+            try? fm.removeItem(atPath: oldPath)
+            try? fm.moveItem(atPath: path, toPath: oldPath)
+        }
+
+        // Append mode — create file if not exists, then open for appending
+        if !fm.fileExists(atPath: path) {
+            fm.createFile(atPath: path, contents: nil)
+        }
         fileHandle = FileHandle(forWritingAtPath: path)
+        fileHandle?.seekToEndOfFile()
 
         let ts = dateFormatter.string(from: Date())
-        let header = "====== CCSwitcher launched \(ts) ======\n"
+        let header = "\n====== CCSwitcher launched \(ts) ======\n"
         if let data = header.data(using: .utf8) {
             fileHandle?.write(data)
         }

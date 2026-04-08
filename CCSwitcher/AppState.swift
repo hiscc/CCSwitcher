@@ -48,10 +48,13 @@ final class AppState: ObservableObject {
     private let accountsKey = "com.ccswitcher.accounts"
     private let usageCacheKey = "com.ccswitcher.usageCache"
     private var refreshTimer: Timer?
+    var loginTask: Task<Void, Never>?
     private var lastAutoSwitchTime: Date?
     private let autoSwitchCooldown: TimeInterval = 600
-    /// Track last-abandoned account to prevent A→B→A oscillation
-    private var lastAbandonedAccountId: UUID?
+    /// Track recently-abandoned accounts with timestamps to prevent multi-account oscillation
+    private var recentlyAbandonedAccounts: [UUID: Date] = [:]
+    /// How long an abandoned account stays deprioritized
+    private let abandonedCooldown: TimeInterval = 1800
 
     // MARK: - Initialization
 
@@ -146,6 +149,13 @@ final class AppState: ObservableObject {
 
     // MARK: - Account Management
 
+    func cancelLogin() {
+        loginTask?.cancel()
+        loginTask = nil
+        isLoggingIn = false
+        log.info("[cancelLogin] Login cancelled by user")
+    }
+
     func addAccount() async {
         log.info("[addAccount] Starting add current account flow...")
         guard claudeAvailable else {
@@ -205,6 +215,10 @@ final class AppState: ObservableObject {
 
     func loginNewAccount() async {
         log.info("[loginNewAccount] ===== Starting login new account flow =====")
+        guard !isLoggingIn else {
+            log.info("[loginNewAccount] Already logging in, skipping")
+            return
+        }
         guard claudeAvailable else {
             errorMessage = "Claude CLI not found"
             log.error("[loginNewAccount] Aborted: Claude CLI not found")
@@ -226,8 +240,10 @@ final class AppState: ObservableObject {
             }
 
             // 2. Run `claude auth login` — this overwrites both keychain and ~/.claude.json
-            log.info("[loginNewAccount] Step 2: Running `claude auth login`...")
-            try await claudeService.login()
+            //    Pass the current email so login() polls until a *different* account appears
+            let currentEmail = activeAccount?.email
+            log.info("[loginNewAccount] Step 2: Running `claude auth login`... (currentEmail=\(currentEmail ?? "nil"))")
+            try await claudeService.login(previousEmail: currentEmail)
             log.info("[loginNewAccount] Step 2: Login process completed")
 
             // 3. Read the new identity from ~/.claude.json
@@ -299,19 +315,23 @@ final class AppState: ObservableObject {
         }
     }
 
-    func removeAccount(_ account: Account) {
-        log.info("[removeAccount] Removing account \(account.id)")
+    func removeAccount(_ account: Account) async {
+        log.info("[removeAccount] Removing account \(account.id) (\(account.email))")
         keychain.removeAccountBackup(forAccountId: account.id.uuidString)
         cachedUsage.removeValue(forKey: account.id)
+        accountUsageErrors.removeValue(forKey: account.id)
         saveUsageCache()
         accounts.removeAll { $0.id == account.id }
         if account.isActive, let first = accounts.first {
             accounts[accounts.startIndex].isActive = true
             activeAccount = accounts.first
-            log.info("[removeAccount] Removed active account, switching to first remaining")
-            Task { await switchTo(first) }
+            log.info("[removeAccount] Removed active account, switching to \(first.email)")
+            saveAccounts()
+            await switchTo(first)
+        } else {
+            if account.isActive { activeAccount = nil }
+            saveAccounts()
         }
-        saveAccounts()
         log.info("[removeAccount] Done. Remaining accounts: \(self.accounts.count)")
     }
 
@@ -371,9 +391,9 @@ final class AppState: ObservableObject {
                 _ = claudeService.captureCurrentCredentials(forAccountId: current.id.uuidString)
             }
 
-            // 2. Run login
+            // 2. Run login — pass account email so polling detects token change for same account
             log.info("[reauth] Running `claude auth login`...")
-            try await claudeService.login()
+            try await claudeService.login(previousEmail: account.email)
 
             // 3. Verify the login result matches the target account
             let status = try await claudeService.getAuthStatus()
@@ -434,8 +454,10 @@ final class AppState: ObservableObject {
 
         log.info("[autoSwitch] Current account \(current.email) at \(Int(currentUtilization))% (threshold: \(autoSwitchThreshold)%), looking for alternative...")
 
-        // Exclude expired tokens (truly unknown); allow 429'd accounts (have cache)
-        // Deprioritize (don't exclude) the last-abandoned account to prevent A→B→A oscillation
+        // Prune expired abandoned entries
+        let now = Date()
+        recentlyAbandonedAccounts = recentlyAbandonedAccounts.filter { now.timeIntervalSince($0.value) < abandonedCooldown }
+
         let threshold = Double(autoSwitchThreshold)
         let candidates = accounts
             .filter { $0.id != current.id }
@@ -447,15 +469,14 @@ final class AppState: ObservableObject {
             }
             .filter { $0.1 < threshold }
             .sorted { a, b in
-                // Primary: lower utilization. Tiebreaker (<10% diff): sooner weekly reset
                 if abs(a.1 - b.1) < 10.0 {
                     return a.2 < b.2
                 }
                 return a.1 < b.1
             }
 
-        // Prefer non-abandoned candidate; fall back to abandoned only if it's the sole option
-        let candidate = candidates.first(where: { $0.0.id != lastAbandonedAccountId })
+        // Prefer non-recently-abandoned candidate; fall back to abandoned only if sole option
+        let candidate = candidates.first(where: { recentlyAbandonedAccounts[$0.0.id] == nil })
             ?? candidates.first
 
         guard let (target, targetUtil, _) = candidate else {
@@ -463,8 +484,8 @@ final class AppState: ObservableObject {
             return
         }
 
-        log.info("[autoSwitch] Switching to \(target.email) at \(Int(targetUtil))%")
-        lastAbandonedAccountId = current.id
+        log.info("[autoSwitch] Switching to \(target.email) at \(Int(targetUtil))%, abandoned=\(recentlyAbandonedAccounts.count) accounts")
+        recentlyAbandonedAccounts[current.id] = now
         lastAutoSwitchTime = Date()
         isAutoSwitching = true
         defer { isAutoSwitching = false }

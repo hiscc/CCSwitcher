@@ -57,6 +57,7 @@ final class KeychainService: Sendable {
     private let claudeAccount: String
     private let backupsFilePath: String
     private let claudeJsonPath: String
+    private let backupLock = NSLock()
 
     private init() {
         self.claudeAccount = NSUserName()
@@ -103,18 +104,16 @@ final class KeychainService: Sendable {
     }
 
     func writeClaudeToken(_ token: String) -> Bool {
-        // Delete then add (security CLI doesn't have a pure "update" for generic passwords)
-        _ = runSecurityStatus(args: ["delete-generic-password", "-s", claudeService, "-a", claudeAccount])
-
-        let added = runSecurityStatus(args: [
+        // -U flag atomically updates if exists, adds if not — no delete needed
+        let result = runSecurityStatus(args: [
             "add-generic-password",
             "-s", claudeService,
             "-a", claudeAccount,
             "-w", token,
             "-U"
         ])
-        log.info("[writeClaudeToken] Result: \(added)")
-        return added
+        log.info("[writeClaudeToken] Result: \(result), token length=\(token.count)")
+        return result
     }
 
     // MARK: - ~/.claude.json oauthAccount Operations
@@ -160,6 +159,8 @@ final class KeychainService: Sendable {
     func saveAccountBackup(token: String, oauthAccount: [String: AnyCodable], forAccountId accountId: String) -> Bool {
         let email = (oauthAccount["emailAddress"]?.value as? String) ?? "?"
         log.info("[saveBackup] Saving for \(accountId) (\(email)), token length=\(token.count)")
+        backupLock.lock()
+        defer { backupLock.unlock() }
         var store = loadBackupStore()
         store[accountId] = AccountBackup(token: token, oauthAccount: oauthAccount)
         let result = saveBackupStore(store)
@@ -168,7 +169,9 @@ final class KeychainService: Sendable {
     }
 
     func getAccountBackup(forAccountId accountId: String) -> AccountBackup? {
+        backupLock.lock()
         let store = loadBackupStore()
+        backupLock.unlock()
         let backup = store[accountId]
         if let backup {
             let email = (backup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
@@ -182,6 +185,8 @@ final class KeychainService: Sendable {
     @discardableResult
     func removeAccountBackup(forAccountId accountId: String) -> Bool {
         log.info("[removeBackup] Removing for accountId=\(accountId)")
+        backupLock.lock()
+        defer { backupLock.unlock() }
         var store = loadBackupStore()
         store.removeValue(forKey: accountId)
         return saveBackupStore(store)

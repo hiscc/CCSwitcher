@@ -11,6 +11,23 @@
 - Usage Dashboard 过期卡片新增 "Re-auth" 按钮，直接触发重新认证
 - `isAutoSwitching` 改用 `defer` 保护，防止异常后永远卡住
 
+### fix: Login 轮询等待 OAuth 完成
+- `login()` 改为轮询机制（每 2s 检查 auth status，最多 120s），不再只等 2 秒
+- 通过 token 字符串直接比较检测同账号重新登录（不用 hashValue）
+- `loginNewAccount()` 传入当前 email 检测账号变更
+- `reauthenticateAccount()` 传入目标 email 正确等待 token 刷新
+- 新增 Cancel 按钮允许用户取消等待，支持 Task cancellation
+- `loginNewAccount()` 增加重入保护
+
+### fix: 全面健壮性审计修复
+- **账号切换回滚**：`switchAccount` oauthAccount 写入失败时自动回滚已写入的 token
+- **Keychain 并发安全**：backup store 的 load-modify-save 加 NSLock 保护
+- **writeClaudeToken 原子化**：去掉多余的 delete 步骤，仅用 `-U` flag 原子更新
+- **removeAccount 等待切换**：从 fire-and-forget 改为 await switchTo，避免状态不一致
+- **自动切换防振荡**：从追踪 1 个改为追踪多个 recently-abandoned 账号（30 分钟冷却）
+- **runClaude 防死锁**：先读 pipe 数据再 waitUntilExit，避免大输出填满缓冲区
+- **日志追加模式**：FileLogger 不再每次启动清空日志，改为追加 + 2MB 轮转
+
 ---
 
 ## v1.1.2 (build 32) — 738899d

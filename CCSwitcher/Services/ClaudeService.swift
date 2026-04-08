@@ -135,14 +135,24 @@ final class ClaudeService: Sendable {
         let targetEmail = (targetBackup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
         log.info("[switchAccount] Step 2: Target backup found (email=\(targetEmail))")
 
-        // 3. Write target token to keychain + target oauthAccount to ~/.claude.json
+        // 3. Snapshot current credentials for rollback, then write target
         log.info("[switchAccount] Step 3: Writing target credentials...")
+        let rollbackToken = keychain.readClaudeToken()
+        let rollbackOAuth = keychain.readOAuthAccount()
+
         guard keychain.writeClaudeToken(targetBackup.token) else {
             log.error("[switchAccount] Step 3: Failed to write token to keychain!")
             throw ClaudeServiceError.keychainWriteFailed
         }
         guard keychain.writeOAuthAccount(targetBackup.oauthAccount) else {
-            log.error("[switchAccount] Step 3: Failed to write oauthAccount to ~/.claude.json!")
+            // Rollback: restore original token since oauthAccount write failed
+            log.error("[switchAccount] Step 3: Failed to write oauthAccount — rolling back token!")
+            if let rollbackToken {
+                _ = keychain.writeClaudeToken(rollbackToken)
+            }
+            if let rollbackOAuth {
+                _ = keychain.writeOAuthAccount(rollbackOAuth)
+            }
             throw ClaudeServiceError.oauthAccountWriteFailed
         }
         log.info("[switchAccount] Step 3: Both token and oauthAccount written")
@@ -189,28 +199,59 @@ final class ClaudeService: Sendable {
     /// Run `claude auth login` which opens browser for OAuth.
     /// Note: The CLI may exit with non-zero status even when login succeeds
     /// (e.g., when running without a TTY). We verify success via `auth status` instead.
-    func login() async throws {
-        log.info("[login] Starting `claude auth login`... (will open browser)")
+    ///
+    /// - Parameter previousEmail: The email currently logged in. Used together with
+    ///   token-hash comparison to detect when login completes (even same-account re-login).
+    func login(previousEmail: String? = nil) async throws {
+        log.info("[login] Starting `claude auth login`... (will open browser, previousEmail=\(previousEmail ?? "nil"))")
+
+        // Snapshot token before login so we can detect same-account re-login via string comparison
+        let preLoginToken = KeychainService.shared.readClaudeToken()
+        log.debug("[login] Pre-login token length: \(preLoginToken?.count ?? 0)")
+
         do {
             _ = try await runClaude(args: ["auth", "login"])
             log.info("[login] `claude auth login` process exited normally")
         } catch let error as ClaudeServiceError {
             switch error {
             case .cliError(let output) where output.contains("Opening browser") || output.contains("sign in"):
-                // CLI exits non-zero after opening browser — expected.
-                // The OAuth flow completes in the browser and writes to keychain directly.
                 log.warning("[login] CLI exited after opening browser (expected): \(output.prefix(100))")
             case .processLaunchFailed:
-                // Binary not found or not executable — this is a real failure
                 throw error
             default:
                 log.warning("[login] CLI exited with error (may still succeed): \(error.localizedDescription)")
             }
         }
 
-        // Give keychain a moment to sync after CLI writes
-        try await Task.sleep(for: .seconds(2))
-        log.info("[login] Post-login delay complete, ready for token capture")
+        // Poll for OAuth completion: check auth status every 2 seconds for up to 120 seconds.
+        // Detect login via email change OR token change (handles same-account re-login).
+        let maxAttempts = 60
+        let interval: Duration = .seconds(2)
+        for attempt in 1...maxAttempts {
+            try Task.checkCancellation()
+            try await Task.sleep(for: interval)
+            do {
+                let status = try await getAuthStatus()
+                if status.loggedIn, let email = status.email {
+                    let currentToken = KeychainService.shared.readClaudeToken()
+                    let tokenChanged = currentToken != preLoginToken
+                    let emailChanged = previousEmail != nil && email != previousEmail
+
+                    if emailChanged || tokenChanged {
+                        log.info("[login] Login detected: email=\(email), emailChanged=\(emailChanged), tokenChanged=\(tokenChanged), after \(attempt * 2)s")
+                        return
+                    }
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                log.debug("[login] Poll attempt \(attempt) failed: \(error.localizedDescription)")
+            }
+            if attempt % 15 == 0 {
+                log.info("[login] Still waiting for OAuth... (\(attempt * 2)s elapsed)")
+            }
+        }
+        log.warning("[login] OAuth polling timed out after \(maxAttempts * 2)s")
     }
 
     /// Run `claude auth logout`
@@ -253,9 +294,9 @@ final class ClaudeService: Sendable {
 
                 do {
                     try process.run()
-                    process.waitUntilExit()
-
+                    // Read pipe BEFORE waitUntilExit to avoid deadlock when pipe buffer fills
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
                     let output = String(data: data, encoding: .utf8) ?? ""
 
                     if process.terminationStatus == 0 {
