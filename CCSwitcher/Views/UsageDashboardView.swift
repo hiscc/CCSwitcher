@@ -25,7 +25,7 @@ struct UsageDashboardView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
-                if appState.accountUsage.isEmpty && appState.accountUsageErrors.isEmpty && appState.isLoading {
+                if appState.usage.isEmpty && appState.isLoading {
                     VStack(spacing: 12) {
                         ProgressView()
                             .controlSize(.small)
@@ -35,7 +35,7 @@ struct UsageDashboardView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)
-                } else if appState.accountUsage.isEmpty && appState.accountUsageErrors.isEmpty {
+                } else if appState.usage.isEmpty {
                     VStack(spacing: 12) {
                         Image(systemName: "chart.bar.xaxis")
                             .font(.system(size: 32))
@@ -54,7 +54,7 @@ struct UsageDashboardView: View {
                     todayActivityCard
 
                     ForEach(sortedAccountsByUsage) { account in
-                        accountUsageCard(account: account, usage: appState.accountUsage[account.id])
+                        accountUsageCard(account: account, state: appState.usage[account.id])
                     }
                 }
 
@@ -193,32 +193,25 @@ struct UsageDashboardView: View {
     /// Accounts sorted by usage (lowest utilization first = most remaining)
     private var sortedAccountsByUsage: [Account] {
         appState.accounts.sorted { a, b in
-            let utilA = appState.accountUsage[a.id]?.fiveHour?.utilization
-                ?? appState.cachedUsage[a.id]?.effectiveSessionUtilization()
-                ?? 999
-            let utilB = appState.accountUsage[b.id]?.fiveHour?.utilization
-                ?? appState.cachedUsage[b.id]?.effectiveSessionUtilization()
-                ?? 999
+            let utilA = appState.usage[a.id]?.effectiveSessionUtilization() ?? 999
+            let utilB = appState.usage[b.id]?.effectiveSessionUtilization() ?? 999
             return utilA < utilB
         }
     }
 
     // MARK: - Per-Account Card
 
-    private func accountUsageCard(account: Account, usage: UsageAPIResponse?) -> some View {
+    private func accountUsageCard(account: Account, state: UsageState?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             accountHeader(account)
-            if let usage = usage {
-                let errorState = appState.accountUsageErrors[account.id]
-                let isRateLimited = errorState?.isRateLimited ?? false
-                usageBars(usage, isRateLimited: isRateLimited)
+            if let usage = state?.usage {
+                usageBars(usage, isRateLimited: state?.isRateLimited ?? false)
                 extraUsageRow(usage.extraUsage)
-            } else if let errorState = appState.accountUsageErrors[account.id] {
-                if errorState.isExpired {
-                    expiredTokenBanner(account: account)
-                } else {
-                    errorBanner(errorState)
-                }
+            } else if let state, state.isExpired {
+                expiredTokenBanner(account: account)
+                rateLimitedPlaceholderBars()
+            } else if let state, let message = state.errorMessage {
+                errorBanner(message: message)
                 rateLimitedPlaceholderBars()
             } else {
                 expiredTokenBanner(account: account)
@@ -309,14 +302,13 @@ struct UsageDashboardView: View {
         }
     }
 
-    /// Placeholder bars when rate limited with no cached data at all
     /// Inline error/status banner shown above placeholder bars
-    private func errorBanner(_ errorState: AppState.UsageErrorState) -> some View {
+    private func errorBanner(message: String) -> some View {
         HStack(spacing: 4) {
-            Image(systemName: errorState.isRateLimited ? "timer" : (errorState.isExpired ? "exclamationmark.triangle" : "xmark.circle"))
+            Image(systemName: "xmark.circle")
                 .font(.caption2)
-                .foregroundStyle(errorState.isRateLimited ? .orange : (errorState.isExpired ? .yellow : .red))
-            Text(errorState.message)
+                .foregroundStyle(.red)
+            Text(message)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)

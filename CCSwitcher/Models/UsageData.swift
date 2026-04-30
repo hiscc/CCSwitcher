@@ -114,6 +114,84 @@ struct CachedUsageEntry: Codable {
     }
 }
 
+// MARK: - Per-account Usage State (single source of truth, replaces three separate dicts)
+
+/// Unified state for a single account's usage. Replaces the previous three dicts
+/// (`accountUsage` + `cachedUsage` + `accountUsageErrors`) which had to be kept in sync
+/// manually and routinely diverged.
+enum UsageState {
+    /// This round's API call succeeded.
+    case fresh(UsageAPIResponse, fetchedAt: Date)
+    /// API call failed but we're showing the previous cached value.
+    case stale(UsageAPIResponse, fetchedAt: Date, reason: String)
+    /// 429 from the API. Cached value (if any) shown alongside the rate-limit indicator.
+    case rateLimited(cached: UsageAPIResponse?, fetchedAt: Date?)
+    /// Token expired or missing. UI should prompt re-auth.
+    case expired(message: String)
+    /// No data and no cache yet (first fetch hasn't happened).
+    case missing
+
+    var usage: UsageAPIResponse? {
+        switch self {
+        case .fresh(let u, _): return u
+        case .stale(let u, _, _): return u
+        case .rateLimited(let cached, _): return cached
+        case .expired, .missing: return nil
+        }
+    }
+
+    var fetchedAt: Date? {
+        switch self {
+        case .fresh(_, let d), .stale(_, let d, _): return d
+        case .rateLimited(_, let d): return d
+        case .expired, .missing: return nil
+        }
+    }
+
+    var isStale: Bool {
+        if case .stale = self { return true }
+        return false
+    }
+
+    var isExpired: Bool {
+        if case .expired = self { return true }
+        return false
+    }
+
+    var isRateLimited: Bool {
+        if case .rateLimited = self { return true }
+        return false
+    }
+
+    /// Human-readable error message, if this state represents an error condition.
+    var errorMessage: String? {
+        switch self {
+        case .stale(_, _, let reason): return reason
+        case .rateLimited: return "Rate limited"
+        case .expired(let m): return m
+        case .fresh, .missing: return nil
+        }
+    }
+
+    /// Reset-aware session utilization: returns 0% if the 5-hour window has already reset.
+    func effectiveSessionUtilization() -> Double? {
+        guard let fiveHour = usage?.fiveHour else { return nil }
+        if let resetDate = fiveHour.resetsAtDate, Date() > resetDate {
+            return 0.0
+        }
+        return fiveHour.utilization
+    }
+
+    /// Reset-aware weekly utilization: returns 0% if the 7-day window has already reset.
+    func effectiveWeeklyUtilization() -> Double? {
+        guard let sevenDay = usage?.sevenDay else { return nil }
+        if let resetDate = sevenDay.resetsAtDate, Date() > resetDate {
+            return 0.0
+        }
+        return sevenDay.utilization
+    }
+}
+
 // MARK: - Stats Cache (matches ~/.claude/stats-cache.json)
 
 struct StatsCache: Codable {

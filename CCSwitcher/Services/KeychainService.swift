@@ -182,6 +182,16 @@ final class KeychainService: Sendable {
         return backup
     }
 
+    /// Return the entire vault. Used by AppState to rebuild the accounts list — vault
+    /// is the single source of truth for account identity (email, organizationUuid, ...).
+    /// UserDefaults `accounts` only persists fields the vault doesn't have (`lastUsed`,
+    /// `subscriptionType`).
+    func allBackups() -> [String: AccountBackup] {
+        backupLock.lock()
+        defer { backupLock.unlock() }
+        return loadBackupStore()
+    }
+
     @discardableResult
     func removeAccountBackup(forAccountId accountId: String) -> Bool {
         log.info("[removeBackup] Removing for accountId=\(accountId)")

@@ -4,3 +4,9 @@
 - **Xcode Project Handling**: The `CCSwitcher.xcodeproj` directory is ignored by Git and should be treated as a disposable build artifact. Any structural changes to the project (e.g., adding/removing files, changing folder structures, altering build targets) MUST be done by modifying `project.yml` and subsequently running `xcodegen generate` in the local environment. Do NOT modify the `.pbxproj` file directly.
 - **Changelog**: `CHANGELOG.md` 记录所有功能迭代历程。每次提交新功能、修复或重构时，必须同步更新此文件的 `Unreleased` 部分。发版时将 Unreleased 内容移入对应版本号下。
 - **Release Build**: 每次打包默认使用 Release 配置，构建完成后复制到 `/Applications/CCSwitcher.app`（覆盖旧版），然后删除 DerivedData 中的 Release 和 Debug 构建产物，以及桌面上可能存在的旧 .app 文件。只保留 `/Applications/CCSwitcher.app` 一个副本。
+
+## 项目知识索引
+
+| 文件 | 何时读取 |
+|------|---------|
+| [.wiki/tech-lessons.md](.wiki/tech-lessons.md) | 调试用量显示异常、token/keychain 异常、账号切换问题前必读 |

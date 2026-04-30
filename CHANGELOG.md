@@ -2,6 +2,94 @@
 
 ## Unreleased (current working changes)
 
+### refactor: 合并三个 usage dict 为 `UsageState` enum（架构第四步）
+- 新增 `UsageState` enum（`.fresh` / `.stale` / `.rateLimited` / `.expired` / `.missing`）作为 per-account usage 的单一 model
+- 删除 `@Published var accountUsage` / `accountUsageErrors` 两个 dict + `UsageErrorState` struct，合并为 `@Published var usage: [UUID: UsageState]`
+- `cachedUsage` 降级为 internal `private var`（不 @Published，仅作 fetch fallback 来源 + 跨启动 warm-start，View 不再直接读它）
+- `UsageState` 提供 reset-aware helpers `effectiveSessionUtilization()` / `effectiveWeeklyUtilization()`，取代 `CachedUsageEntry` 上的同名方法
+- View 改动：
+  - `CCSwitcherApp.menuBarLabel`：双 fallback 链 `accountUsage[id]?.fiveHour?.utilization ?? cachedUsage[id]?.effective...` 简化为 `usage[id]?.effectiveSessionUtilization()`
+  - `UsageDashboardView`：`accountUsageCard(account:usage:)` → `accountUsageCard(account:state:)`；errorBanner 接受 String 而非 struct；sortedAccountsByUsage 单源排序
+- `fetchOneAccountUsage` 直接返回 `UsageState`，不再用 三元组 `(usage, error, cacheEntry)`；`fetchAllAccountUsage` 在 `.fresh` 时才更新 cachedUsage
+- 副作用：UI 层不再有"有 usage 但同时有 error"这种结构性撕裂态——状态在 enum 类型层面 mutually exclusive
+
+### fix: runClaude 加 `withTaskCancellationHandler`（响应 Task 取消）
+- 新增 `ProcessRef` class（`@unchecked Sendable`，NSLock 保护）跨 cancel-handler 边界共享 Process 引用
+- `runClaude` 包装 `withTaskCancellationHandler { try await withCheckedThrowingContinuation { ... } } onCancel: { processRef.terminate() }`
+- 之前只有 `cancelLogin` 路径手动 terminate child process；现在所有 runClaude 调用（getAuthStatus / logout / --version / login）的 Task 取消都会主动 terminate child，不再让 CLI 进程比 Swift Task 活得更久
+
+### refactor: 删除 `repairCorruptedBackups` + 加 reconcile 漂移日志
+- `repairCorruptedBackups` 在 vault-derived 架构下变成死代码：reconcile 已经把 `account.email` 改成跟 vault 一样，repair 的 `account.email != backup.oauthAccount.email` 比较永远不会触发。删除函数 + 删除 performRefresh 中的调用 + 删除冗余的第二次 reconcile 调用
+- `reconcileAccountsWithVault` 在覆盖 email 字段前 log 漂移："email drift for X: UI had 'A', vault has 'B' — using vault"，让历史污染数据被覆盖时用户视角能从日志看到原因
+
+### refactor: accounts 列表 derive from vault（架构层第三步）
+- vault（keychain `me.xueshi.ccswitcher.backups`）正式成为账号身份字段（id/email/orgName）的真相源
+- 新增 `KeychainService.allBackups()` 暴露整个 vault；新增 `AppState.reconcileAccountsWithVault()` 用 vault 重建 accounts：删孤儿、更新身份字段、补全 vault 里有但 accounts 里没有的条目
+- `init()` 启动时立即 reconcile；`performRefresh()` 在 `getAuthStatus` **之前**和 `repairCorruptedBackups` **之后**各 reconcile 一次（前者让 updateActiveAccount 能匹配新加的 vault 条目，后者清理 repair 删掉的 backup 留下的孤儿）
+- UserDefaults `com.ccswitcher.accounts` 现在只为持有 vault 没有的纯 UI 元数据（`lastUsed` / `subscriptionType`），不再是身份真相源
+- 副作用：被 `repairCorruptedBackups` 删除 backup 的孤儿账号现在会从 UI 列表自动消失（之前会留下"无法点开"的死条目）
+
+### refactor: usage state 整体 atomic replace（架构层第二步）
+- `fetchAllAccountUsage` 不再逐账号 partial mutate `accountUsage` / `accountUsageErrors`，改为构造局部 `newUsage` / `newErrors` / `newCache` 字典，循环结束后整体赋值
+- 拆出 `fetchOneAccountUsage(_:currentCache:) -> FetchResult` 纯函数，每个账号的结果（usage / error / cacheEntry）作为 struct 返回，主循环只负责组装
+- 删除 `fallbackToCache(for:)` 反模式（其行为是「无 cache 时保留旧 stale 数据」，正是要消灭的源头），所有失败路径统一用 `currentCache[id]?.usage`——有 cache 用 cache，无 cache 写 nil
+- 副作用：每轮 fetch 结束时三个 @Published dict 内容必然 = 本轮所有账号的最新结果，不可能再有 stale 残留；error 与 usage 同时更新到一致状态
+- 注：三个 dict（`accountUsage` / `cachedUsage` / `accountUsageErrors`）的对外接口未变，View 不需要改；下一步可选合并为 `[UUID: UsageState]` enum，让 View 端读取更简洁
+
+### refactor: active 状态单源（架构层第一步）
+- 引入 `AppState.setActiveAccount(id:)` 作为 active 状态唯一写入路径，统一同步 `accounts[i].isActive` 与 `activeAccount` 引用，杜绝两者 diverge
+- 替换 `addAccount` / `loginNewAccount` / `switchTo` / `reauthenticate` / `updateActiveAccount` / `removeAccount` 中所有手写的 `for i in accounts.indices { accounts[i].isActive = ... }` + `activeAccount = ...` 双写循环
+- 此为「OS 层是唯一真相源、CCSwitcher 只是同步层」原则的渐进改造，下一步将合并 `accountUsage` / `cachedUsage` / `accountUsageErrors` 三 dict 为单一 `UsageState`
+
+### fix: removeAccount switchTo 失败时 abort 删除（防 OS 层 rollback 后不一致）
+- `ClaudeService.switchAccount` step 4 验证失败时会主动 rollback keychain 到原账号 token；若 `removeAccount` 在 switchTo 失败后继续清本地数据，会留下「OS 槽位指向已删除账号、本地无对应 backup」的死锁状态
+- 现在 switchTo 失败时直接 return，保留账号让用户重试（通过比较 errorMessage 前后判断失败）
+
+### fix: switchAccount step 5 re-capture 缺 expectedEmail 校验
+- `ClaudeService.switchAccount:319` 在切换后 re-capture 凭据时未传 `expectedEmail`——这破坏了「keychain email 不匹配则拒绝写入 backup」的身份安全不变量
+- 现传入 `targetAccount.email`，与流程里其他 capture 路径保持一致
+
+### refactor: 修复 isLoggingIn 提前清空的 race window
+- 旧代码在 `loginNewAccount` 和 `reauthenticateAccount` 末尾「`isLoggingIn = false; await refresh()`」——为了让 `refresh()` 内部 `guard !isLoggingIn` 不跳过，提前清空状态，但这开启了 await 期间其它 task 观察到 `isLoggingIn=false` 的 race window
+- 拆 `refresh()` 为外层 guard + 内部 `performRefresh()`；login 流末尾直接调 `performRefresh()` 绕过 guard，不再需要提前清空 `isLoggingIn`，由 `defer` 统一管理
+
+### chore: 清理 CCSwitcherApp 残留 dead state
+- 删除随 promo timer 一起遗留的 `@State isDoubleUsageActive` 字段
+
+### fix: removeAccount 移除 active 账号时 OS 槽位未真正切换
+- 旧代码先把 `accounts[first].isActive = true` 和 `activeAccount = first` 提前赋值，再调 `switchTo(first)`——`switchTo` 内部 `currentActive.id != account.id` 判断 short-circuit，导致 keychain 里仍是被删账号的 token
+- 修复：先 `await switchTo(target)` 切换 OS 槽位，再删 backup / accounts 数组 / 清 active 引用
+- 顺手补上 `accountUsage.removeValue(forKey: account.id)`（之前漏清）
+
+### security: 移除 Authorization header 入日志
+- `ClaudeService.getUsageLimits` 不再 log `request.allHTTPHeaderFields`——之前会把完整 `Bearer sk-ant-oat01-...` 写到 `~/Library/Logs/CCSwitcher.log`，token 在有效期内可被任何能读该文件的进程冒用
+
+### fix: login() polling 超时不再静默成功
+- `login(previousEmail:)` polling 60 次（120s）后改为 `throw ClaudeServiceError.loginTimeout`，不再 warning + return 让调用方误以为登录成功并 capture 旧 credentials
+- `loginNewAccount` / `reauthenticateAccount` 现在能正确感知超时并显示错误
+
+### fix: 外部 `claude auth logout` 后 active 状态不响应
+- `updateActiveAccount` 在 CLI `status.loggedIn=false` 或登录到非托管账号时，清空 active 状态（`setActiveAccount(id: nil)`）；之前直接 `return` 留下幻影 active 账号 + 过期 cached usage
+
+### fix: fetchAllAccountUsage token 缺失时不再静默 continue
+- 之前的 `continue` 路径既不写 error 状态、也不清 stale `accountUsage` 值，UI 看到的是上轮的旧数据但没任何提示；现在显式 fallback 到 cache + 写入 expired error
+- 解决「某轮 fetch 失败但 UI 假装成功」的隐式 bug
+
+### chore: 移除过期的 double-usage promo 死代码
+- 删除 `CCSwitcherApp.checkDoubleUsage` 及其每分钟 timer——promo 时间硬编码为 2026-03-13 至 2026-03-29，已过期成死代码
+
+### fix: 登录卡死「Waiting for browser login」+ Cancel 不真取消
+- `runClaude` 的 pipe 读取从 `readDataToEndOfFile()` 改为 `readabilityHandler` 异步收集 — `claude auth login` 派生的 background helper 子进程会继承 stdout fd 不释放，导致 readDataToEndOfFile 永远等不到 EOF，UI 卡在 Waiting 即使 OAuth 已完成
+- `waitUntilExit` 后立即 detach handler 并关闭读端，不再等待孙子进程持有的 pipe 写端关闭
+- `cancelLogin` 现在真正调用 `process.terminate()` 杀掉 `claude auth login` 子进程，不再只是 cancel Swift Task（Task cancellation 无法打断阻塞的 syscall，导致重复点登录会堆积僵尸进程）
+- `ClaudeService` 新增 `cancelCurrentLogin()` 接口，用 NSLock 保护 currentLoginProcess 引用
+
+### fix: 切换验证失败时回滚 keychain，防止凭据级联污染
+- `switchAccount` Step 4 验证失败（未登录或 email 不匹配）时，自动回滚 keychain 到切换前状态，不再留下脏数据
+- `switchTo` 在切换前校验 backup email 是否匹配目标账号，发现不匹配时直接触发 re-auth 而非写入错误凭据
+- `captureCurrentCredentials` 新增 `expectedEmail` 参数，keychain email 不匹配时拒绝保存，防止备份被污染
+- `loginNewAccount` 和 `reauthenticateAccount` 备份当前账号时传入 expectedEmail 校验
+
 ### fix: Token refresh on re-login and account switch
 - `login()` 不再因 CLI 非零退出码（如 "Opening browser to sign in..."）中断登录流程，仅在 binary 不存在时才抛异常
 - `loginNewAccount` 已存在账号重新登录后，正确清除 expired 状态、标记 active、调用 `refresh()` 刷新用量

@@ -3,10 +3,34 @@ import Foundation
 private let log = FileLog("Claude")
 
 /// Interacts with the Claude CLI to get auth status and manage accounts.
-final class ClaudeService: Sendable {
+final class ClaudeService: @unchecked Sendable {
     static let shared = ClaudeService()
 
     private let claudePath: String
+
+    /// Tracks the currently-running `claude auth login` process so cancelLogin
+    /// can actually terminate it (vs. just cancelling the Swift Task, which
+    /// doesn't reach the blocking syscalls).
+    private let processLock = NSLock()
+    private var currentLoginProcess: Process?
+
+    private func setLoginProcess(_ proc: Process?) {
+        processLock.lock()
+        currentLoginProcess = proc
+        processLock.unlock()
+    }
+
+    /// Terminate the in-flight `claude auth login` process, if any.
+    /// Safe to call from any thread / actor.
+    func cancelCurrentLogin() {
+        processLock.lock()
+        let proc = currentLoginProcess
+        currentLoginProcess = nil
+        processLock.unlock()
+        guard let proc, proc.isRunning else { return }
+        log.info("[cancelCurrentLogin] Terminating claude auth login (pid=\(proc.processIdentifier))")
+        proc.terminate()
+    }
 
     private init() {
         // Discover nvm-managed node bin paths
@@ -69,7 +93,6 @@ final class ClaudeService: Sendable {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
 
         log.debug("[getUsageLimits] REQUEST URL: \(url.absoluteString)")
-        log.debug("[getUsageLimits] REQUEST HEADERS: \(request.allHTTPHeaderFields ?? [:])")
 
         let (responseData, response) = try await URLSession.shared.data(for: request)
         let httpResponse = response as? HTTPURLResponse
@@ -264,29 +287,45 @@ final class ClaudeService: Sendable {
         }
         log.info("[switchAccount] Step 3: Both token and oauthAccount written")
 
-        // 4. Verify
+        // 4. Verify — rollback keychain on ANY failure (CLI error, not-logged-in, email mismatch)
         log.info("[switchAccount] Step 4: Verifying with `claude auth status`...")
-        let status = try await getAuthStatus()
+        let status: AuthStatus
+        do {
+            status = try await getAuthStatus()
+        } catch {
+            log.error("[switchAccount] Step 4: getAuthStatus failed (\(error.localizedDescription)) — rolling back keychain!")
+            if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) }
+            if let rollbackOAuth { _ = keychain.writeOAuthAccount(rollbackOAuth) }
+            throw error
+        }
         guard status.loggedIn else {
-            log.error("[switchAccount] Step 4: Not logged in after switch!")
+            log.error("[switchAccount] Step 4: Not logged in after switch — rolling back keychain!")
+            if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) }
+            if let rollbackOAuth { _ = keychain.writeOAuthAccount(rollbackOAuth) }
             throw ClaudeServiceError.switchVerificationFailed
         }
         if status.email != targetAccount.email {
-            log.error("[switchAccount] Step 4: Logged in as \(status.email ?? "nil") instead of \(targetAccount.email)")
+            log.error("[switchAccount] Step 4: Logged in as \(status.email ?? "nil") instead of \(targetAccount.email) — rolling back keychain!")
+            if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) }
+            if let rollbackOAuth { _ = keychain.writeOAuthAccount(rollbackOAuth) }
             throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: status.email ?? "unknown")
         }
         log.info("[switchAccount] Step 4: Switch verified — logged in as \(status.email ?? "")")
 
         // 5. Re-capture credentials — the CLI may have internally refreshed the access token
         //    during the auth status check. Update backup so we have the freshest token.
+        //    Pass expectedEmail to maintain the identity-safety invariant: never write a backup
+        //    whose keychain email doesn't match the target account.
         log.info("[switchAccount] Step 5: Re-capturing credentials after switch...")
-        let recaptured = captureCurrentCredentials(forAccountId: targetAccount.id.uuidString)
+        let recaptured = captureCurrentCredentials(forAccountId: targetAccount.id.uuidString, expectedEmail: targetAccount.email)
         log.info("[switchAccount] Step 5: Re-capture result: \(recaptured)")
     }
 
-    /// Capture the current Claude auth token + oauthAccount and associate with an account
-    func captureCurrentCredentials(forAccountId accountId: String) -> Bool {
-        log.info("[capture] Capturing credentials for account \(accountId)...")
+    /// Capture the current Claude auth token + oauthAccount and associate with an account.
+    /// When `expectedEmail` is provided, the capture is skipped if the keychain email doesn't match
+    /// (prevents saving wrong credentials after a failed switch leaves the keychain dirty).
+    func captureCurrentCredentials(forAccountId accountId: String, expectedEmail: String? = nil) -> Bool {
+        log.info("[capture] Capturing credentials for account \(accountId) (expected=\(expectedEmail ?? "any"))...")
         let keychain = KeychainService.shared
         guard let token = keychain.readClaudeToken() else {
             log.error("[capture] Failed: no token found in keychain")
@@ -297,6 +336,10 @@ final class ClaudeService: Sendable {
             return false
         }
         let email = (oauthAccount["emailAddress"]?.value as? String) ?? "?"
+        if let expected = expectedEmail, email != expected {
+            log.error("[capture] ABORT: keychain email (\(email)) != expected (\(expected)) — keychain may be dirty")
+            return false
+        }
         log.info("[capture] Token + oauthAccount found (email=\(email)), saving backup...")
         let result = keychain.saveAccountBackup(token: token, oauthAccount: oauthAccount, forAccountId: accountId)
         log.info("[capture] Save result: \(result)")
@@ -358,7 +401,8 @@ final class ClaudeService: Sendable {
                 log.info("[login] Still waiting for OAuth... (\(attempt * 2)s elapsed)")
             }
         }
-        log.warning("[login] OAuth polling timed out after \(maxAttempts * 2)s")
+        log.warning("[login] OAuth polling timed out after \(maxAttempts * 2)s — throwing loginTimeout")
+        throw ClaudeServiceError.loginTimeout
     }
 
     /// Run `claude auth logout`
@@ -370,10 +414,25 @@ final class ClaudeService: Sendable {
 
     // MARK: - CLI Runner
 
+    /// Shared mutable handle so the cancellation closure can reach the running Process
+    /// across the actor boundary. Class wrapper because `Process` itself isn't Sendable.
+    private final class ProcessRef: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        func set(_ p: Process?) { lock.lock(); process = p; lock.unlock() }
+        func terminate() {
+            lock.lock(); let p = process; process = nil; lock.unlock()
+            if let p, p.isRunning { p.terminate() }
+        }
+    }
+
     private func runClaude(args: [String]) async throws -> String {
         log.debug("[runClaude] Running: claude \(args.joined(separator: " "))")
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [claudePath] in
+        let isLogin = args.first == "auth" && args.count > 1 && args[1] == "login"
+        let processRef = ProcessRef()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async { [self, claudePath] in
                 let process = Process()
                 let pipe = Pipe()
 
@@ -399,12 +458,43 @@ final class ClaudeService: Sendable {
                 env["HOME"] = homeDir
                 process.environment = env
 
+                // Async pipe read — `claude auth login` spawns background helpers
+                // (e.g. update watcher) that inherit the stdout fd. Using
+                // readDataToEndOfFile() would block until ALL pipe writers
+                // close, which never happens while those helpers run, so the
+                // app would hang in "Waiting for browser login..." even after
+                // OAuth succeeds. We collect output via a readabilityHandler
+                // and stop reading the moment the main process exits.
+                let bufferLock = NSLock()
+                let buffer = NSMutableData()
+                let readHandle = pipe.fileHandleForReading
+                readHandle.readabilityHandler = { handle in
+                    let chunk = handle.availableData
+                    guard !chunk.isEmpty else { return }
+                    bufferLock.lock()
+                    buffer.append(chunk)
+                    bufferLock.unlock()
+                }
+
                 do {
                     try process.run()
-                    // Read pipe BEFORE waitUntilExit to avoid deadlock when pipe buffer fills
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    processRef.set(process)
+                    if isLogin { self.setLoginProcess(process) }
                     process.waitUntilExit()
-                    let output = String(data: data, encoding: .utf8) ?? ""
+                    processRef.set(nil)
+                    if isLogin { self.setLoginProcess(nil) }
+
+                    // Drain any data that arrived between the last handler
+                    // callback and process exit, then detach the handler and
+                    // close the read end. We deliberately do NOT wait for
+                    // pipe EOF (grandchildren may still hold the write end).
+                    readHandle.readabilityHandler = nil
+                    let trailing = readHandle.availableData
+                    bufferLock.lock()
+                    if !trailing.isEmpty { buffer.append(trailing) }
+                    let output = String(data: buffer as Data, encoding: .utf8) ?? ""
+                    bufferLock.unlock()
+                    try? readHandle.close()
 
                     if process.terminationStatus == 0 {
                         log.debug("[runClaude] Success (exit 0), output length: \(output.count)")
@@ -414,10 +504,20 @@ final class ClaudeService: Sendable {
                         continuation.resume(throwing: ClaudeServiceError.cliError(output))
                     }
                 } catch {
+                    processRef.set(nil)
+                    if isLogin { self.setLoginProcess(nil) }
+                    readHandle.readabilityHandler = nil
+                    try? readHandle.close()
                     log.error("[runClaude] Process launch failed: \(error.localizedDescription)")
                     continuation.resume(throwing: ClaudeServiceError.processLaunchFailed(error))
                 }
+                }
             }
+        } onCancel: {
+            // Task was cancelled — terminate the running CLI process so it doesn't
+            // outlive its caller. Without this, `getAuthStatus`/`logout`/etc. processes
+            // keep running after the Swift Task that spawned them is dropped.
+            processRef.terminate()
         }
     }
 }
@@ -433,6 +533,7 @@ enum ClaudeServiceError: LocalizedError {
     case oauthAccountWriteFailed
     case switchVerificationFailed
     case switchWrongAccount(expected: String, actual: String)
+    case loginTimeout
 
     var errorDescription: String? {
         switch self {
@@ -452,6 +553,8 @@ enum ClaudeServiceError: LocalizedError {
             return "Account switch verification failed"
         case .switchWrongAccount(let expected, let actual):
             return "Switch failed: expected \(expected) but got \(actual). Try removing and re-adding the account."
+        case .loginTimeout:
+            return "Login did not complete within 2 minutes. Please try again."
         }
     }
 }
