@@ -67,14 +67,12 @@ struct Account: Identifiable, Codable, Hashable {
     }
 }
 
-// MARK: - Auth Status (from `claude auth status`)
+// MARK: - Auth Status
 
-struct AuthStatus: Codable {
+/// Auth state derived from the OS truth sources (keychain token + ~/.claude.json oauthAccount).
+struct AuthStatus {
     let loggedIn: Bool
-    let authMethod: String?
-    let apiProvider: String?
     let email: String?
-    let orgId: String?
     let orgName: String?
     let subscriptionType: String?
 }

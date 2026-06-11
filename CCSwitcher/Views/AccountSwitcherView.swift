@@ -4,6 +4,8 @@ import SwiftUI
 struct AccountSwitcherView: View {
     @EnvironmentObject private var appState: AppState
     @State private var showingAddConfirm = false
+    @State private var authCode = ""
+    @State private var isSubmittingCode = false
 
     var body: some View {
         ScrollView {
@@ -97,7 +99,7 @@ struct AccountSwitcherView: View {
             }
 
             Button {
-                Task { await appState.reauthenticateAccount(account) }
+                appState.startReauthenticate(account)
             } label: {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.caption)
@@ -126,25 +128,64 @@ struct AccountSwitcherView: View {
 
     // MARK: - Add Account Buttons
 
+    private func submitCode() {
+        let code = authCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty, !isSubmittingCode else { return }
+        isSubmittingCode = true
+        appState.loginTask = Task {
+            await appState.submitAuthCode(code)
+            isSubmittingCode = false
+            // Clear the field once the login left the pending state (success or cancel)
+            if !appState.isLoggingIn { authCode = "" }
+        }
+    }
+
     @ViewBuilder
     private var addAccountButtons: some View {
         if appState.isLoggingIn {
-            // Logging in state
+            // Native OAuth: authorize in browser, then paste the code shown
             VStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Waiting for browser login...")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("Complete the login in your browser, then return here.")
+                Text("Finish sign-in in your browser")
+                    .font(.caption.weight(.medium))
+                Text("Authorize in the page we opened, copy the code it shows, then paste it below.")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Cancel") {
-                    appState.cancelLogin()
+
+                TextField("Paste authorization code", text: $authCode)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .disabled(isSubmittingCode)
+                    .onSubmit { submitCode() }
+
+                HStack(spacing: 8) {
+                    Button("Cancel") {
+                        authCode = ""
+                        appState.cancelLogin()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button("Reopen Page") {
+                        appState.reopenAuthPage()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button {
+                        submitCode()
+                    } label: {
+                        if isSubmittingCode {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Text("Complete Login")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.brand)
+                    .controlSize(.small)
+                    .disabled(isSubmittingCode || authCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
             }
             .frame(maxWidth: .infinity)
             .padding(12)
@@ -187,7 +228,7 @@ struct AccountSwitcherView: View {
             VStack(spacing: 8) {
                 // Primary: Login new account via browser
                 Button {
-                    appState.loginTask = Task { await appState.loginNewAccount() }
+                    appState.startLoginNewAccount()
                 } label: {
                     Label("Login New Account", systemImage: "person.badge.plus")
                         .font(.subheadline)

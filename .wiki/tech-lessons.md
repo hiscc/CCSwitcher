@@ -122,3 +122,47 @@ security find-generic-password -s "me.xueshi.ccswitcher.backups" -a "all-account
 ——
 
 来源：2026-04-30 与用户调试。证据：CCSwitcher 日志 03:04 段、`security find-generic-password` 读出的 backup 元数据、claude.ai 网页 Settings/Usage 截图。
+
+## 6. 登录新账号永远超时 —— 三层根因 + 部署假成功(2026-06-11)
+
+### 症状(用户视角)
+
+点 "Login New Account" → 浏览器完成授权 → app 一直 "Waiting for browser login..." → 最终 "Login did not complete within 2 minutes"。反复重试均失败。
+
+### 三层根因(由浅入深,前两层修完仍失败才挖到第三层)
+
+1. **stderr 污染 stdout**:`runClaude` 把 stderr/stdout 指向同一个 Pipe。Bun 在无 AVX 的 CPU 上每次启动都向 stderr 打 `warn: CPU lacks AVX support...`,拼到 `auth status` 的 JSON 前 → `JSONDecoder` 全部解析失败。已修:独立 errPipe。
+2. **登录检测假阳性**:`claude auth login` 启动时会先清空 keychain token。旧检测 `currentToken != preLoginToken` 在 token 被清成 nil 时误判"token 变了=登录成功"。日志铁证:`[readClaudeToken] No token found!` 紧跟 `Login detected ... tokenChanged=true`。已修:稳定确认窗口(连续 6 次 OK 才算成功)+ 要求 token 非 nil。
+3. **CLI 子进程随机早退,OAuth code 无人接收(结构性,真凶)**:实测 `claude auth login` 的 OAuth 流程是 `redirect_uri=https://platform.claude.com/oauth/code/callback`(托管页),code 由托管页转发回 CLI 监听的 localhost 随机端口(或手动粘贴进 CLI stdin)。**CLI 主进程必须活到用户完成浏览器授权**。app 里该子进程曾 5 秒内 exit 1(手动跑/管道环境跑均存活 10s+,排除 stdin/管道/浏览器因素 → 指向 Bun 无 AVX 随机崩溃)。主进程一死,授权 code 无人接收,keychain 永不更新,轮询必超时。
+
+### 衍生坑
+
+- **僵尸 login 进程**:旧版 app 取消登录不杀子进程,`claude auth login` 僵尸可存活数小时,各占一个 localhost 监听端口(实测见过 2 个活 3.5h)。排查命令:`ps aux | grep "claude auth login"`。
+- **部署假成功**:`xcodebuild` 成功 ≠ `/Applications` 里是新版。曾发生 cp 未生效仍跑 Apr 30 旧二进制,调试结论全部失真。**铁律:部署后必须 `md5 -q 构建产物 == md5 -q /Applications/...` 双向校验 + `stat -f %Sm` 看二进制时间。**
+
+### 结构性结论(✅ 已全部实施 2026-06-11)
+
+在无 AVX(Bun 自警告 strange crashes)的机器上,任何"依赖 CLI 子进程"的设计都不可靠。最终架构:**app 零 fork**——
+- 登录 = 原生 OAuth:PKCE + 授权 URL(与 CLI 逐字段一致)→ 用户粘贴托管页显示的 `code#state` → POST `platform.claude.com/v1/oauth/token` 换 token → GET `api.anthropic.com/api/oauth/profile`(Bearer + `anthropic-beta: oauth-2025-04-20`)拿身份/订阅 → 双写 keychain + `~/.claude.json`
+- `getAuthStatus` = 直读两个 OS 真相源(loggedIn = token 存在 + oauthAccount email 存在;subscriptionType 取自 token JSON)
+- switch 验证 = 回读自己写的槽位;`runClaude`/`logout()`/`isClaudeAvailable`/login 进程跟踪全部删除
+- 关键 API 事实:profile 端点返回 account{uuid,email,display_name,has_claude_max,has_claude_pro} + organization{uuid,name,organization_type,billing_type,rate_limit_tier,…},足够构建完整 oauthAccount;token 端点同时服务 refresh_token 和 authorization_code 两种 grant
+
+### 验证命令
+
+```bash
+# 僵尸 login 进程 + 各自监听端口
+ps aux | grep "claude auth login" | grep -v grep
+lsof -p <pid> -a -i | grep -i listen
+
+# 手动复现 CLI 行为(会弹授权页,别点授权,测完 kill)
+claude auth login </dev/null >/tmp/o 2>/tmp/e & PID=$!; # 观察存活/退出码
+
+# 部署校验
+md5 -q ~/Library/Developer/Xcode/DerivedData/CCSwitcher-*/Build/Products/Release/CCSwitcher.app/Contents/MacOS/CCSwitcher
+md5 -q /Applications/CCSwitcher.app/Contents/MacOS/CCSwitcher
+```
+
+——
+
+来源:2026-06-11 与用户调试登录失败。证据:CCSwitcher.log 05:43–06:57 段、ps/lsof 僵尸进程取证、claude auth login 对照实验(/tmp/loginA.out、/tmp/loginB.out)。

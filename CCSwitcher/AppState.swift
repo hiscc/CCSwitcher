@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import Combine
 
 private let log = FileLog("AppState")
@@ -19,8 +20,10 @@ final class AppState: ObservableObject {
     @Published var activeSessions: [SessionInfo] = []
     @Published var isLoading = false
     @Published var isLoggingIn = false
+    /// Non-nil while a native OAuth login waits for the user to paste the code.
+    /// Drives the paste-code UI and the "Reopen Page" action.
+    @Published var pendingAuthURL: URL?
     @Published var errorMessage: String?
-    @Published var claudeAvailable = false
     @Published var lastUsageRefresh: Date?
     @Published var costSummary: CostSummary = .empty
     @Published var activityStats: ActivityStats = .empty
@@ -77,9 +80,11 @@ final class AppState: ObservableObject {
 
     /// Rebuild `accounts` from the vault (single source of truth for identity).
     /// - Adds any account present in vault but missing locally
-    /// - Updates email/orgName/displayName from vault.oauthAccount
+    /// - Updates email/orgName/displayName from vault.oauthAccount,
+    ///   subscriptionType from the vault token JSON (falls back to the persisted
+    ///   value only when an old token JSON lacks the field)
     /// - Removes any local account that has no vault entry (orphan)
-    /// - Preserves `lastUsed` and `subscriptionType` (those aren't in the vault)
+    /// - Preserves `lastUsed` (the only field the vault doesn't have)
     private func reconcileAccountsWithVault() {
         let vault = keychain.allBackups()
         let vaultIds: [(UUID, AccountBackup)] = vault.compactMap { (idStr, backup) in
@@ -100,6 +105,7 @@ final class AppState: ObservableObject {
             let oauth = backup.oauthAccount
             let email = (oauth["emailAddress"]?.value as? String) ?? ""
             let orgName = oauth["organizationName"]?.value as? String
+            let subscriptionType = ClaudeService.extractSubscriptionType(from: backup.token)
 
             if let idx = accounts.firstIndex(where: { $0.id == id }) {
                 // Log any email/org drift between persisted UI metadata and vault
@@ -110,6 +116,9 @@ final class AppState: ObservableObject {
                 accounts[idx].email = email
                 accounts[idx].orgName = orgName
                 accounts[idx].displayName = orgName ?? email
+                if let subscriptionType {
+                    accounts[idx].subscriptionType = subscriptionType
+                }
             } else {
                 let account = Account(
                     id: id,
@@ -117,7 +126,7 @@ final class AppState: ObservableObject {
                     displayName: orgName ?? email,
                     provider: .claudeCode,
                     orgName: orgName,
-                    subscriptionType: nil,
+                    subscriptionType: subscriptionType,
                     isActive: false,
                     lastUsed: nil
                 )
@@ -167,23 +176,12 @@ final class AppState: ObservableObject {
         defer { isLoading = false; isRefreshing = false }
         errorMessage = nil
 
-        claudeAvailable = await claudeService.isClaudeAvailable()
-        log.info("[refresh] Claude available: \(self.claudeAvailable)")
-
         // Re-derive accounts BEFORE getAuthStatus so updateActiveAccount can find any
         // vault entry added externally (otherwise it'd see "logged-in but unmanaged"
         // and clear active state for an account that's actually in the vault).
         reconcileAccountsWithVault()
 
-        if claudeAvailable {
-            do {
-                let status = try await claudeService.getAuthStatus()
-                updateActiveAccount(from: status)
-            } catch {
-                log.error("[refresh] getAuthStatus failed: \(error.localizedDescription)")
-                errorMessage = error.localizedDescription
-            }
-        }
+        updateActiveAccount(from: claudeService.getAuthStatus())
 
         // Passive token health check (no CLI calls, keychain reads only)
         diagnoseTokenHealth()
@@ -232,12 +230,8 @@ final class AppState: ObservableObject {
     func cancelLogin() {
         loginTask?.cancel()
         loginTask = nil
-        // Actually terminate the underlying `claude auth login` child process —
-        // cancelling the Swift Task alone doesn't reach blocking I/O syscalls,
-        // leaving the CLI to linger and block subsequent login attempts.
-        claudeService.cancelCurrentLogin()
-        isLoggingIn = false
-        log.info("[cancelLogin] Login cancelled by user (process terminated)")
+        clearPendingLogin()
+        log.info("[cancelLogin] Login cancelled by user")
     }
 
     /// Single source of truth for active account state. Reconciles `accounts[i].isActive`
@@ -256,150 +250,167 @@ final class AppState: ObservableObject {
 
     func addAccount() async {
         log.info("[addAccount] Starting add current account flow...")
-        guard claudeAvailable else {
-            errorMessage = "Claude CLI not found"
-            log.error("[addAccount] Aborted: Claude CLI not found")
+        let status = claudeService.getAuthStatus()
+        guard status.loggedIn, let email = status.email else {
+            errorMessage = "Not logged in to Claude. Use Login New Account instead."
+            log.error("[addAccount] Aborted: not logged in")
+            return
+        }
+        log.info("[addAccount] Current auth: logged in, sub=\(status.subscriptionType ?? "nil")")
+
+        if accounts.contains(where: { $0.email == email }) {
+            errorMessage = "Account already exists"
+            log.warning("[addAccount] Aborted: duplicate account")
             return
         }
 
-        do {
-            let status = try await claudeService.getAuthStatus()
-            guard status.loggedIn, let email = status.email else {
-                errorMessage = "Not logged in to Claude. Run 'claude auth login' first."
-                log.error("[addAccount] Aborted: not logged in")
-                return
-            }
-            log.info("[addAccount] Current auth: logged in, sub=\(status.subscriptionType ?? "nil")")
+        let account = Account(
+            email: email,
+            displayName: status.orgName ?? email,
+            provider: .claudeCode,
+            orgName: status.orgName,
+            subscriptionType: status.subscriptionType,
+            isActive: false
+        )
+        log.info("[addAccount] Created account model, id=\(account.id)")
 
-            if accounts.contains(where: { $0.email == email }) {
-                errorMessage = "Account already exists"
-                log.warning("[addAccount] Aborted: duplicate account")
-                return
-            }
-
-            let account = Account(
-                email: email,
-                displayName: status.orgName ?? email,
-                provider: .claudeCode,
-                orgName: status.orgName,
-                subscriptionType: status.subscriptionType,
-                isActive: false
-            )
-            log.info("[addAccount] Created account model, id=\(account.id)")
-
-            log.info("[addAccount] Capturing token from keychain...")
-            let captured = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: email)
-            if !captured {
-                errorMessage = "Could not capture auth token from keychain"
-                log.error("[addAccount] Token capture failed!")
-                return
-            }
-            log.info("[addAccount] Token captured successfully")
-
-            let isFirst = accounts.isEmpty
-            accounts.append(account)
-            if isFirst {
-                setActiveAccount(id: account.id)
-                log.info("[addAccount] First account, setting as active")
-            }
-            saveAccounts()
-            log.info("[addAccount] Account saved. Total accounts: \(self.accounts.count)")
-        } catch {
-            errorMessage = error.localizedDescription
-            log.error("[addAccount] Error: \(error.localizedDescription)")
+        let captured = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: email)
+        if !captured {
+            errorMessage = "Could not capture auth token from keychain"
+            log.error("[addAccount] Token capture failed!")
+            return
         }
+
+        let isFirst = accounts.isEmpty
+        accounts.append(account)
+        if isFirst {
+            setActiveAccount(id: account.id)
+            log.info("[addAccount] First account, setting as active")
+        }
+        saveAccounts()
+        log.info("[addAccount] Account saved. Total accounts: \(self.accounts.count)")
     }
 
-    func loginNewAccount() async {
-        log.info("[loginNewAccount] ===== Starting login new account flow =====")
+    // MARK: - Browser Login (native OAuth — no CLI in the critical path)
+
+    private var pendingOAuth: PendingOAuth?
+    private var pendingReauthAccountId: UUID?
+
+    func startLoginNewAccount() {
+        startBrowserLogin(reauthFor: nil)
+    }
+
+    func startReauthenticate(_ account: Account) {
+        startBrowserLogin(reauthFor: account)
+    }
+
+    /// Begin a native OAuth browser login: back up the current account, open the
+    /// authorize page, then wait for the user to paste the code (`submitAuthCode`).
+    private func startBrowserLogin(reauthFor account: Account?) {
         guard !isLoggingIn else {
-            log.info("[loginNewAccount] Already logging in, skipping")
+            log.info("[browserLogin] Already logging in, skipping")
             return
         }
-        guard claudeAvailable else {
-            errorMessage = "Claude CLI not found"
-            log.error("[loginNewAccount] Aborted: Claude CLI not found")
-            return
+        log.info("[browserLogin] ===== Starting (\(account.map { "reauth \($0.email)" } ?? "new account")) =====")
+        errorMessage = nil
+
+        // Back up the current account before the new login overwrites the OS slot
+        if let current = activeAccount {
+            let backed = claudeService.captureCurrentCredentials(forAccountId: current.id.uuidString, expectedEmail: current.email)
+            log.info("[browserLogin] Backup of \(current.email): \(backed)")
+        } else {
+            log.info("[browserLogin] No active account, skipping backup")
         }
 
+        let pending = claudeService.beginNativeOAuth()
+        pendingOAuth = pending
+        pendingReauthAccountId = account?.id
+        pendingAuthURL = pending.authorizeURL
         isLoggingIn = true
-        defer { isLoggingIn = false }
+        NSWorkspace.shared.open(pending.authorizeURL)
+    }
+
+    func reopenAuthPage() {
+        if let url = pendingAuthURL { NSWorkspace.shared.open(url) }
+    }
+
+    private func clearPendingLogin() {
+        pendingOAuth = nil
+        pendingReauthAccountId = nil
+        pendingAuthURL = nil
+        isLoggingIn = false
+    }
+
+    /// Complete the pending browser login with the code pasted from the callback page.
+    /// On failure the pending state is kept so the user can fix the paste and retry.
+    func submitAuthCode(_ pastedCode: String) async {
+        guard let pending = pendingOAuth else {
+            log.warning("[browserLogin] submitAuthCode with no pending login")
+            return
+        }
+        log.info("[browserLogin] Submitting authorization code...")
         errorMessage = nil
 
         do {
-            // 1. Back up current account (token + oauthAccount) before login overwrites them
-            if let current = activeAccount {
-                log.info("[loginNewAccount] Step 1: Backing up current account (\(current.email))...")
-                let backed = claudeService.captureCurrentCredentials(forAccountId: current.id.uuidString, expectedEmail: current.email)
-                log.info("[loginNewAccount] Step 1: Backup result: \(backed)")
-            } else {
-                log.info("[loginNewAccount] Step 1: No active account, skipping backup")
-            }
+            let result = try await claudeService.completeNativeOAuth(pastedCode: pastedCode, pending: pending)
+            log.info("[browserLogin] Logged in as \(result.email)")
 
-            // 2. Run `claude auth login` — this overwrites both keychain and ~/.claude.json
-            //    Pass the current email so login() polls until a *different* account appears
-            let currentEmail = activeAccount?.email
-            log.info("[loginNewAccount] Step 2: Running `claude auth login`... (currentEmail=\(currentEmail ?? "nil"))")
-            try await claudeService.login(previousEmail: currentEmail)
-            log.info("[loginNewAccount] Step 2: Login process completed")
-
-            // 3. Read the new identity from ~/.claude.json
-            log.info("[loginNewAccount] Step 3: Reading post-login state...")
-            let status = try await claudeService.getAuthStatus()
-            guard status.loggedIn, let email = status.email else {
-                errorMessage = "Login did not complete"
-                log.error("[loginNewAccount] Step 3: Not logged in after login!")
-                return
-            }
-            log.info("[loginNewAccount] Step 3: Logged in as \(email)")
-
-            // 4. Check for duplicate — if exists, refresh its backup and usage
-            if let existing = accounts.firstIndex(where: { $0.email == email }) {
-                log.info("[loginNewAccount] Step 4: Account already exists, refreshing backup")
-                _ = claudeService.captureCurrentCredentials(forAccountId: accounts[existing].id.uuidString, expectedEmail: email)
-
-                // Clear stale expired state — next refresh will repopulate.
+            if let reauthId = pendingReauthAccountId {
+                // Re-auth: the result must match the target account
+                guard let index = accounts.firstIndex(where: { $0.id == reauthId }) else {
+                    log.error("[browserLogin] Reauth target account vanished")
+                    clearPendingLogin()
+                    return
+                }
+                guard result.email == accounts[index].email else {
+                    errorMessage = "Logged in as \(result.email), but expected \(accounts[index].email). Sign in with that account, then paste the new code."
+                    log.error("[browserLogin] Reauth email mismatch: got \(result.email)")
+                    return
+                }
+                _ = claudeService.captureCurrentCredentials(forAccountId: accounts[index].id.uuidString, expectedEmail: result.email)
+                usage.removeValue(forKey: accounts[index].id)
+                accounts[index].orgName = result.orgName
+                accounts[index].subscriptionType = result.subscriptionType
+                setActiveAccount(id: reauthId)
+                saveAccounts()
+            } else if let existing = accounts.firstIndex(where: { $0.email == result.email }) {
+                // Duplicate of an existing account — refresh its credentials
+                log.info("[browserLogin] Account already exists, refreshing backup")
+                _ = claudeService.captureCurrentCredentials(forAccountId: accounts[existing].id.uuidString, expectedEmail: result.email)
                 usage.removeValue(forKey: accounts[existing].id)
-
                 setActiveAccount(id: accounts[existing].id)
                 saveAccounts()
-
-                // Use performRefresh() to bypass the isLoggingIn guard without prematurely
-                // flipping it to false (which would expose a race window mid-flight).
-                await performRefresh()
-                log.info("[loginNewAccount] Step 4: Existing account credentials refreshed and usage updated")
-                return
+            } else {
+                // Brand-new account
+                let account = Account(
+                    email: result.email,
+                    displayName: result.orgName ?? result.email,
+                    provider: .claudeCode,
+                    orgName: result.orgName,
+                    subscriptionType: result.subscriptionType,
+                    isActive: false
+                )
+                let captured = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: result.email)
+                guard captured else {
+                    errorMessage = "Could not capture credentials"
+                    log.error("[browserLogin] Capture failed!")
+                    clearPendingLogin()
+                    return
+                }
+                accounts.append(account)
+                setActiveAccount(id: account.id)
+                saveAccounts()
+                log.info("[browserLogin] New account active. Total: \(self.accounts.count)")
             }
 
-            // 5. Create new account and capture credentials (token + oauthAccount)
-            let account = Account(
-                email: email,
-                displayName: status.orgName ?? email,
-                provider: .claudeCode,
-                orgName: status.orgName,
-                subscriptionType: status.subscriptionType,
-                isActive: false
-            )
-            log.info("[loginNewAccount] Step 5: Created account, id=\(account.id)")
-
-            let captured = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: email)
-            if !captured {
-                errorMessage = "Could not capture credentials"
-                log.error("[loginNewAccount] Step 5: Capture failed!")
-                return
-            }
-
-            // 6. Mark new account as active (single source of truth)
-            accounts.append(account)
-            setActiveAccount(id: account.id)
-            saveAccounts()
-            log.info("[loginNewAccount] Step 6: New account active. Total: \(self.accounts.count)")
-
+            clearPendingLogin()
             await performRefresh()
-            log.info("[loginNewAccount] ===== Login completed =====")
+            log.info("[browserLogin] ===== Login completed =====")
+        } catch is CancellationError {
+            log.info("[browserLogin] Cancelled")
         } catch {
             errorMessage = error.localizedDescription
-            log.error("[loginNewAccount] Error: \(error.localizedDescription)")
+            log.error("[browserLogin] Error: \(error.localizedDescription)")
         }
     }
 
@@ -455,8 +466,8 @@ final class AppState: ObservableObject {
         let backupEmail = (backup.oauthAccount["emailAddress"]?.value as? String) ?? ""
         if !backupEmail.isEmpty && backupEmail != account.email {
             log.error("[switchTo] ABORT: backup email (\(backupEmail)) != target (\(account.email)) — corrupted backup, needs re-auth")
-            errorMessage = "Stored credentials belong to \(backupEmail), not \(account.email). Re-authenticating..."
-            await reauthenticateAccount(account)
+            errorMessage = "Stored credentials belong to \(backupEmail), not \(account.email). Sign in again to fix."
+            startReauthenticate(account)
             return
         }
 
@@ -473,8 +484,8 @@ final class AppState: ObservableObject {
                 // Continue with the switch using refreshed token (don't return)
             } else {
                 log.warning("[switchTo] Auto-refresh failed for \(account.email), falling back to re-auth")
-                errorMessage = "Token expired for \(account.email). Re-authenticating..."
-                await reauthenticateAccount(account)
+                errorMessage = "Token expired for \(account.email). Sign in again to continue."
+                startReauthenticate(account)
                 return
             }
         }
@@ -495,63 +506,6 @@ final class AppState: ObservableObject {
             errorMessage = error.localizedDescription
             isLoading = false
             log.error("[switchTo] Switch failed: \(error.localizedDescription)")
-        }
-    }
-
-    /// Re-authenticate an account by running `claude auth login` and capturing fresh credentials.
-    func reauthenticateAccount(_ account: Account) async {
-        log.info("[reauth] ===== Re-authenticating account \(account.id) (\(account.email)) =====")
-        guard claudeAvailable else {
-            errorMessage = "Claude CLI not found"
-            return
-        }
-
-        isLoggingIn = true
-        defer { isLoggingIn = false }
-        errorMessage = nil
-
-        do {
-            // 1. Back up current active account before login overwrites it
-            if let current = activeAccount, current.id != account.id {
-                log.info("[reauth] Backing up current account before login...")
-                _ = claudeService.captureCurrentCredentials(forAccountId: current.id.uuidString, expectedEmail: current.email)
-            }
-
-            // 2. Run login — pass account email so polling detects token change for same account
-            log.info("[reauth] Running `claude auth login`...")
-            try await claudeService.login(previousEmail: account.email)
-
-            // 3. Verify the login result matches the target account
-            let status = try await claudeService.getAuthStatus()
-            guard status.loggedIn, let email = status.email else {
-                errorMessage = "Login did not complete"
-                return
-            }
-
-            guard email == account.email else {
-                errorMessage = "Logged in as \(email), but expected \(account.email). Credentials not updated."
-                log.error("[reauth] Email mismatch: got \(email), expected \(account.email)")
-                return
-            }
-
-            // 4. Capture the fresh token and clear stale expired state
-            let captured = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: account.email)
-            log.info("[reauth] Token capture result: \(captured)")
-            usage.removeValue(forKey: account.id)
-
-            // 5. Update account metadata
-            if let index = accounts.firstIndex(where: { $0.id == account.id }) {
-                accounts[index].orgName = status.orgName
-                accounts[index].subscriptionType = status.subscriptionType
-                setActiveAccount(id: accounts[index].id)
-                saveAccounts()
-            }
-
-            await performRefresh()
-            log.info("[reauth] ===== Re-authentication completed =====")
-        } catch {
-            errorMessage = error.localizedDescription
-            log.error("[reauth] Error: \(error.localizedDescription)")
         }
     }
 
@@ -659,6 +613,18 @@ final class AppState: ObservableObject {
         return .expired(message: reason)
     }
 
+    /// Persist a refreshed token to wherever this account's credentials live:
+    /// active account → OS keychain slot (so the CLI gets the fresh token too) + vault;
+    /// inactive account → vault entry only.
+    private func persistRefreshedToken(_ tokenJSON: String, for account: Account) {
+        if account.isActive {
+            _ = keychain.writeClaudeToken(tokenJSON)
+            _ = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: account.email)
+        } else if let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) {
+            keychain.saveAccountBackup(token: tokenJSON, oauthAccount: backup.oauthAccount, forAccountId: account.id.uuidString)
+        }
+    }
+
     private func fetchOneAccountUsage(_ account: Account, isFirst: Bool, currentCache: [UUID: CachedUsageEntry]) async -> UsageState {
         var tokenJSON: String?
         if account.isActive {
@@ -667,18 +633,14 @@ final class AppState: ObservableObject {
             tokenJSON = keychain.getAccountBackup(forAccountId: account.id.uuidString)?.token
         }
 
-        // Pre-check token expiry for non-active accounts — try auto-refresh before giving up
-        if let tj = tokenJSON, !account.isActive, ClaudeService.isTokenExpired(tj) {
+        // Pre-check token expiry — refresh proactively instead of eating a guaranteed 401.
+        // Applies to the active account too: its refreshed token is written back to the
+        // OS keychain slot, so the CLI also benefits instead of carrying a stale token.
+        if let tj = tokenJSON, ClaudeService.isTokenExpired(tj) {
             log.info("[fetchUsage] Token expired locally for \(account.email), attempting auto-refresh...")
             if let refreshedJSON = await claudeService.refreshAccessToken(tokenJSON: tj) {
                 log.info("[fetchUsage] Token refreshed for \(account.email)")
-                if let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) {
-                    keychain.saveAccountBackup(
-                        token: refreshedJSON,
-                        oauthAccount: backup.oauthAccount,
-                        forAccountId: account.id.uuidString
-                    )
-                }
+                persistRefreshedToken(refreshedJSON, for: account)
                 tokenJSON = refreshedJSON
             } else {
                 log.warning("[fetchUsage] Auto-refresh failed for \(account.email), marking as expired")
@@ -708,12 +670,7 @@ final class AppState: ObservableObject {
             if let tj = currentTokenJSON,
                let refreshedJSON = await claudeService.refreshAccessToken(tokenJSON: tj) {
                 log.info("[fetchUsage] Token refreshed for \(account.email)")
-                if account.isActive {
-                    keychain.writeClaudeToken(refreshedJSON)
-                    _ = claudeService.captureCurrentCredentials(forAccountId: account.id.uuidString, expectedEmail: account.email)
-                } else if let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) {
-                    keychain.saveAccountBackup(token: refreshedJSON, oauthAccount: backup.oauthAccount, forAccountId: account.id.uuidString)
-                }
+                persistRefreshedToken(refreshedJSON, for: account)
                 if let newToken = ClaudeService.extractAccessToken(from: refreshedJSON),
                    let result = try? await claudeService.getUsageLimits(accessToken: newToken) {
                     log.info("[fetchUsage] Recovered \(account.email) via auto-refresh.")

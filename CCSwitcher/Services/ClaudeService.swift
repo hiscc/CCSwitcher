@@ -1,80 +1,46 @@
 import Foundation
+import CryptoKit
 
 private let log = FileLog("Claude")
 
-/// Interacts with the Claude CLI to get auth status and manage accounts.
+/// Manages Claude account credentials through the OS truth sources (keychain token +
+/// ~/.claude.json oauthAccount) and Anthropic's OAuth/usage HTTP APIs.
+///
+/// Deliberately spawns NO Claude CLI processes: the CLI runs on Bun, which is
+/// unstable on CPUs without AVX (random early exits), and everything the app
+/// needs is available from the files/keychain the CLI itself reads, plus HTTP.
 final class ClaudeService: @unchecked Sendable {
     static let shared = ClaudeService()
 
-    private let claudePath: String
-
-    /// Tracks the currently-running `claude auth login` process so cancelLogin
-    /// can actually terminate it (vs. just cancelling the Swift Task, which
-    /// doesn't reach the blocking syscalls).
-    private let processLock = NSLock()
-    private var currentLoginProcess: Process?
-
-    private func setLoginProcess(_ proc: Process?) {
-        processLock.lock()
-        currentLoginProcess = proc
-        processLock.unlock()
-    }
-
-    /// Terminate the in-flight `claude auth login` process, if any.
-    /// Safe to call from any thread / actor.
-    func cancelCurrentLogin() {
-        processLock.lock()
-        let proc = currentLoginProcess
-        currentLoginProcess = nil
-        processLock.unlock()
-        guard let proc, proc.isRunning else { return }
-        log.info("[cancelCurrentLogin] Terminating claude auth login (pid=\(proc.processIdentifier))")
-        proc.terminate()
-    }
-
-    private init() {
-        // Discover nvm-managed node bin paths
-        let nvmPaths: [String] = {
-            let nvmDir = "\(NSHomeDirectory())/.nvm/versions/node"
-            guard let nodes = try? FileManager.default.contentsOfDirectory(atPath: nvmDir) else { return [] }
-            return nodes.sorted().reversed().map { "\(nvmDir)/\($0)/bin/claude" }
-        }()
-
-        let possiblePaths = [
-            "/usr/local/bin/claude",
-            "/opt/homebrew/bin/claude",
-            "\(NSHomeDirectory())/.npm-global/bin/claude",
-            "\(NSHomeDirectory())/.local/bin/claude",
-            "\(NSHomeDirectory())/.claude/local/claude"
-        ] + nvmPaths
-        self.claudePath = possiblePaths.first { FileManager.default.fileExists(atPath: $0) }
-            ?? "claude"
-        log.info("Claude binary path: \(self.claudePath)")
-    }
+    private init() {}
 
     // MARK: - Auth Status
 
-    func getAuthStatus() async throws -> AuthStatus {
-        log.info("[getAuthStatus] Fetching auth status...")
-        let output = try await runClaude(args: ["auth", "status"])
-        guard let data = output.data(using: .utf8) else {
-            log.error("[getAuthStatus] Invalid output (not UTF-8)")
-            throw ClaudeServiceError.invalidOutput
+    /// Read auth state directly from the OS truth sources — the same two slots
+    /// the CLI's `auth status` reads. Forking the CLI here added a Bun runtime
+    /// dependency (and its crash modes) for information the app already owns.
+    func getAuthStatus() -> AuthStatus {
+        let keychain = KeychainService.shared
+        guard let tokenJSON = keychain.readClaudeToken(),
+              let oauthAccount = keychain.readOAuthAccount(),
+              let email = oauthAccount["emailAddress"]?.value as? String else {
+            log.info("[getAuthStatus] Not logged in (missing token or oauthAccount)")
+            return AuthStatus(loggedIn: false, email: nil, orgName: nil, subscriptionType: nil)
         }
-        let status = try JSONDecoder().decode(AuthStatus.self, from: data)
-        log.info("[getAuthStatus] loggedIn=\(status.loggedIn), provider=\(status.apiProvider ?? "nil"), sub=\(status.subscriptionType ?? "nil")")
-        return status
+        let orgName = oauthAccount["organizationName"]?.value as? String
+        let subscriptionType = Self.extractSubscriptionType(from: tokenJSON)
+        log.info("[getAuthStatus] loggedIn=true, email=\(email), sub=\(subscriptionType ?? "nil")")
+        return AuthStatus(loggedIn: true, email: email, orgName: orgName, subscriptionType: subscriptionType)
     }
 
-    func isClaudeAvailable() async -> Bool {
-        do {
-            let version = try await runClaude(args: ["--version"])
-            log.info("[isClaudeAvailable] YES, version: \(version.trimmingCharacters(in: .whitespacesAndNewlines))")
-            return true
-        } catch {
-            log.error("[isClaudeAvailable] NO, error: \(error.localizedDescription)")
-            return false
+    /// Extract subscriptionType from a token JSON (keychain format).
+    static func extractSubscriptionType(from tokenJSON: String) -> String? {
+        guard let data = tokenJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any] else {
+            return nil
         }
+        return oauth["subscriptionType"] as? String
     }
 
     // MARK: - Usage API
@@ -287,17 +253,11 @@ final class ClaudeService: @unchecked Sendable {
         }
         log.info("[switchAccount] Step 3: Both token and oauthAccount written")
 
-        // 4. Verify — rollback keychain on ANY failure (CLI error, not-logged-in, email mismatch)
-        log.info("[switchAccount] Step 4: Verifying with `claude auth status`...")
-        let status: AuthStatus
-        do {
-            status = try await getAuthStatus()
-        } catch {
-            log.error("[switchAccount] Step 4: getAuthStatus failed (\(error.localizedDescription)) — rolling back keychain!")
-            if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) }
-            if let rollbackOAuth { _ = keychain.writeOAuthAccount(rollbackOAuth) }
-            throw error
-        }
+        // 4. Verify by reading back the OS slots — rollback on any mismatch.
+        // Reading our own writes is the strongest check available: the CLI's
+        // `auth status` reads exactly these two sources anyway.
+        log.info("[switchAccount] Step 4: Verifying OS slots...")
+        let status = getAuthStatus()
         guard status.loggedIn else {
             log.error("[switchAccount] Step 4: Not logged in after switch — rolling back keychain!")
             if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) }
@@ -312,13 +272,9 @@ final class ClaudeService: @unchecked Sendable {
         }
         log.info("[switchAccount] Step 4: Switch verified — logged in as \(status.email ?? "")")
 
-        // 5. Re-capture credentials — the CLI may have internally refreshed the access token
-        //    during the auth status check. Update backup so we have the freshest token.
-        //    Pass expectedEmail to maintain the identity-safety invariant: never write a backup
-        //    whose keychain email doesn't match the target account.
-        log.info("[switchAccount] Step 5: Re-capturing credentials after switch...")
-        let recaptured = captureCurrentCredentials(forAccountId: targetAccount.id.uuidString, expectedEmail: targetAccount.email)
-        log.info("[switchAccount] Step 5: Re-capture result: \(recaptured)")
+        // (No re-capture step: nothing can mutate the keychain between our Step 3
+        // write and here now that verification doesn't fork the CLI — the vault
+        // already holds exactly what we just wrote.)
     }
 
     /// Capture the current Claude auth token + oauthAccount and associate with an account.
@@ -346,203 +302,220 @@ final class ClaudeService: @unchecked Sendable {
         return result
     }
 
-    /// Run `claude auth login` which opens browser for OAuth.
-    /// Note: The CLI may exit with non-zero status even when login succeeds
-    /// (e.g., when running without a TTY). We verify success via `auth status` instead.
-    ///
-    /// - Parameter previousEmail: The email currently logged in. Used together with
-    ///   token-hash comparison to detect when login completes (even same-account re-login).
-    func login(previousEmail: String? = nil) async throws {
-        log.info("[login] Starting `claude auth login`... (will open browser, previousEmail=\(previousEmail ?? "nil"))")
+    // MARK: - Native OAuth Login (no CLI in the critical path)
+    //
+    // `claude auth login` requires its CLI process to stay alive for the whole
+    // browser dance: the hosted callback page hands the authorization code back
+    // to the CLI's localhost listener. On machines where Bun is unstable (CPUs
+    // without AVX — Bun itself warns "strange crashes may occur") that child can
+    // die early, after which login can never complete. So we run the OAuth
+    // authorization-code + PKCE flow ourselves and write the exact artifacts the
+    // CLI would: the keychain token JSON and oauthAccount in ~/.claude.json.
+    // The user pastes the code shown by the hosted callback page into the app.
 
-        // Snapshot token before login so we can detect same-account re-login via string comparison
-        let preLoginToken = KeychainService.shared.readClaudeToken()
-        log.debug("[login] Pre-login token length: \(preLoginToken?.count ?? 0)")
+    private static let oauthAuthorizeBase = "https://claude.com/cai/oauth/authorize"
+    private static let oauthRedirectURI = "https://platform.claude.com/oauth/code/callback"
+    private static let oauthScope = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+    private static let oauthProfileURL = URL(string: "https://api.anthropic.com/api/oauth/profile")!
 
-        do {
-            _ = try await runClaude(args: ["auth", "login"])
-            log.info("[login] `claude auth login` process exited normally")
-        } catch let error as ClaudeServiceError {
-            switch error {
-            case .cliError(let output) where output.contains("Opening browser") || output.contains("sign in"):
-                log.warning("[login] CLI exited after opening browser (expected): \(output.prefix(100))")
-            case .processLaunchFailed:
-                throw error
-            default:
-                log.warning("[login] CLI exited with error (may still succeed): \(error.localizedDescription)")
-            }
-        }
+    /// Generate a PKCE verifier/challenge pair + state and build the authorize URL.
+    /// Parameters mirror the CLI's own authorize URL verbatim.
+    func beginNativeOAuth() -> PendingOAuth {
+        let verifier = Self.base64URL(Self.randomBytes(32))
+        let challenge = Self.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
+        let state = Self.base64URL(Self.randomBytes(32))
 
-        // Poll for OAuth completion: check auth status every 2 seconds for up to 120 seconds.
-        // Detect login via email change OR token change (handles same-account re-login).
-        let maxAttempts = 60
-        let interval: Duration = .seconds(2)
-        for attempt in 1...maxAttempts {
-            try Task.checkCancellation()
-            try await Task.sleep(for: interval)
-            do {
-                let status = try await getAuthStatus()
-                if status.loggedIn, let email = status.email {
-                    let currentToken = KeychainService.shared.readClaudeToken()
-                    let tokenChanged = currentToken != preLoginToken
-                    let emailChanged = previousEmail != nil && email != previousEmail
-
-                    if emailChanged || tokenChanged {
-                        log.info("[login] Login detected: email=\(email), emailChanged=\(emailChanged), tokenChanged=\(tokenChanged), after \(attempt * 2)s")
-                        return
-                    }
-                }
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                log.debug("[login] Poll attempt \(attempt) failed: \(error.localizedDescription)")
-            }
-            if attempt % 15 == 0 {
-                log.info("[login] Still waiting for OAuth... (\(attempt * 2)s elapsed)")
-            }
-        }
-        log.warning("[login] OAuth polling timed out after \(maxAttempts * 2)s — throwing loginTimeout")
-        throw ClaudeServiceError.loginTimeout
+        var comps = URLComponents(string: Self.oauthAuthorizeBase)!
+        comps.queryItems = [
+            URLQueryItem(name: "code", value: "true"),
+            URLQueryItem(name: "client_id", value: Self.oauthClientId),
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "redirect_uri", value: Self.oauthRedirectURI),
+            URLQueryItem(name: "scope", value: Self.oauthScope),
+            URLQueryItem(name: "code_challenge", value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "state", value: state),
+        ]
+        log.info("[nativeOAuth] Begin login, state=\(state.prefix(8))…")
+        return PendingOAuth(codeVerifier: verifier, state: state, authorizeURL: comps.url!)
     }
 
-    /// Run `claude auth logout`
-    func logout() async throws {
-        log.info("[logout] Running `claude auth logout`...")
-        _ = try await runClaude(args: ["auth", "logout"])
-        log.info("[logout] Logout complete")
-    }
+    /// Exchange the pasted authorization code for tokens, write keychain +
+    /// ~/.claude.json, and return the new identity. The code copied from the
+    /// hosted callback page has the form "<code>#<state>".
+    func completeNativeOAuth(pastedCode raw: String, pending: PendingOAuth) async throws -> NativeLoginResult {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw ClaudeServiceError.invalidAuthCode("Code is empty") }
 
-    // MARK: - CLI Runner
-
-    /// Shared mutable handle so the cancellation closure can reach the running Process
-    /// across the actor boundary. Class wrapper because `Process` itself isn't Sendable.
-    private final class ProcessRef: @unchecked Sendable {
-        private let lock = NSLock()
-        private var process: Process?
-        func set(_ p: Process?) { lock.lock(); process = p; lock.unlock() }
-        func terminate() {
-            lock.lock(); let p = process; process = nil; lock.unlock()
-            if let p, p.isRunning { p.terminate() }
-        }
-    }
-
-    private func runClaude(args: [String]) async throws -> String {
-        log.debug("[runClaude] Running: claude \(args.joined(separator: " "))")
-        let isLogin = args.first == "auth" && args.count > 1 && args[1] == "login"
-        let processRef = ProcessRef()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                DispatchQueue.global(qos: .userInitiated).async { [self, claudePath] in
-                let process = Process()
-                let pipe = Pipe()
-
-                process.executableURL = URL(fileURLWithPath: claudePath)
-                process.arguments = args
-                process.standardOutput = pipe
-                process.standardError = pipe
-
-                var env = ProcessInfo.processInfo.environment
-                let homeDir = NSHomeDirectory()
-                // Include the directory containing the resolved claude binary
-                // so that `node` (and other dependencies) are also on PATH
-                let claudeBinDir = (claudePath as NSString).deletingLastPathComponent
-                let extraPaths = [
-                    claudeBinDir,
-                    "/opt/homebrew/bin",
-                    "/usr/local/bin",
-                    "\(homeDir)/.local/bin",
-                    "\(homeDir)/.npm-global/bin"
-                ]
-                let existingPath = env["PATH"] ?? "/usr/bin:/bin"
-                env["PATH"] = (extraPaths + [existingPath]).joined(separator: ":")
-                env["HOME"] = homeDir
-                process.environment = env
-
-                // Async pipe read — `claude auth login` spawns background helpers
-                // (e.g. update watcher) that inherit the stdout fd. Using
-                // readDataToEndOfFile() would block until ALL pipe writers
-                // close, which never happens while those helpers run, so the
-                // app would hang in "Waiting for browser login..." even after
-                // OAuth succeeds. We collect output via a readabilityHandler
-                // and stop reading the moment the main process exits.
-                let bufferLock = NSLock()
-                let buffer = NSMutableData()
-                let readHandle = pipe.fileHandleForReading
-                readHandle.readabilityHandler = { handle in
-                    let chunk = handle.availableData
-                    guard !chunk.isEmpty else { return }
-                    bufferLock.lock()
-                    buffer.append(chunk)
-                    bufferLock.unlock()
-                }
-
-                do {
-                    try process.run()
-                    processRef.set(process)
-                    if isLogin { self.setLoginProcess(process) }
-                    process.waitUntilExit()
-                    processRef.set(nil)
-                    if isLogin { self.setLoginProcess(nil) }
-
-                    // Drain any data that arrived between the last handler
-                    // callback and process exit, then detach the handler and
-                    // close the read end. We deliberately do NOT wait for
-                    // pipe EOF (grandchildren may still hold the write end).
-                    readHandle.readabilityHandler = nil
-                    let trailing = readHandle.availableData
-                    bufferLock.lock()
-                    if !trailing.isEmpty { buffer.append(trailing) }
-                    let output = String(data: buffer as Data, encoding: .utf8) ?? ""
-                    bufferLock.unlock()
-                    try? readHandle.close()
-
-                    if process.terminationStatus == 0 {
-                        log.debug("[runClaude] Success (exit 0), output length: \(output.count)")
-                        continuation.resume(returning: output)
-                    } else {
-                        log.error("[runClaude] Failed (exit \(process.terminationStatus)), output: \(output.prefix(200))")
-                        continuation.resume(throwing: ClaudeServiceError.cliError(output))
-                    }
-                } catch {
-                    processRef.set(nil)
-                    if isLogin { self.setLoginProcess(nil) }
-                    readHandle.readabilityHandler = nil
-                    try? readHandle.close()
-                    log.error("[runClaude] Process launch failed: \(error.localizedDescription)")
-                    continuation.resume(throwing: ClaudeServiceError.processLaunchFailed(error))
-                }
-                }
+        let code: String
+        let state: String
+        if let hash = trimmed.firstIndex(of: "#") {
+            code = String(trimmed[..<hash])
+            state = String(trimmed[trimmed.index(after: hash)...])
+            guard state == pending.state else {
+                log.error("[nativeOAuth] State mismatch — code is from a different login attempt")
+                throw ClaudeServiceError.invalidAuthCode("This code belongs to a different sign-in attempt. Click \"Reopen Page\" and copy the code from the new page.")
             }
-        } onCancel: {
-            // Task was cancelled — terminate the running CLI process so it doesn't
-            // outlive its caller. Without this, `getAuthStatus`/`logout`/etc. processes
-            // keep running after the Swift Task that spawned them is dropped.
-            processRef.terminate()
+        } else {
+            code = trimmed
+            state = pending.state
         }
+
+        // 1. Exchange code for tokens (same endpoint the token refresh already uses)
+        var request = URLRequest(url: Self.oauthTokenURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("claude-code/1.0", forHTTPHeaderField: "User-Agent")
+        let body: [String: String] = [
+            "grant_type": "authorization_code",
+            "code": code,
+            "state": state,
+            "client_id": Self.oauthClientId,
+            "redirect_uri": Self.oauthRedirectURI,
+            "code_verifier": pending.codeVerifier,
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let resp = String(data: data, encoding: .utf8) ?? ""
+            log.error("[nativeOAuth] Token exchange HTTP \(status): \(resp.prefix(300))")
+            throw ClaudeServiceError.oauthExchangeFailed("HTTP \(status). Check the pasted code and try again.")
+        }
+        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = result["access_token"] as? String,
+              let refreshToken = result["refresh_token"] as? String,
+              let expiresIn = (result["expires_in"] as? NSNumber)?.doubleValue else {
+            log.error("[nativeOAuth] Unexpected token response shape")
+            throw ClaudeServiceError.oauthExchangeFailed("Unexpected token response")
+        }
+        log.info("[nativeOAuth] Token exchange OK (expires in \(Int(expiresIn / 3600))h)")
+
+        // 2. Fetch identity + subscription with the fresh token
+        var profileReq = URLRequest(url: Self.oauthProfileURL)
+        profileReq.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        profileReq.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        let (profData, profResp) = try await URLSession.shared.data(for: profileReq)
+        guard (profResp as? HTTPURLResponse)?.statusCode == 200,
+              let profile = try JSONSerialization.jsonObject(with: profData) as? [String: Any],
+              let account = profile["account"] as? [String: Any],
+              let email = account["email"] as? String else {
+            let status = (profResp as? HTTPURLResponse)?.statusCode ?? 0
+            log.error("[nativeOAuth] Profile fetch failed (HTTP \(status))")
+            throw ClaudeServiceError.profileFetchFailed("HTTP \(status)")
+        }
+        let organization = profile["organization"] as? [String: Any] ?? [:]
+        let orgName = organization["name"] as? String
+
+        let subscriptionType: String?
+        if (account["has_claude_max"] as? Bool) == true {
+            subscriptionType = "max"
+        } else if (account["has_claude_pro"] as? Bool) == true {
+            subscriptionType = "pro"
+        } else if let orgType = organization["organization_type"] as? String {
+            subscriptionType = orgType.replacingOccurrences(of: "claude_", with: "")
+        } else {
+            subscriptionType = nil
+        }
+
+        // 3. Build the keychain token JSON (same shape the CLI writes)
+        var oauthDict: [String: Any] = [
+            "accessToken": accessToken,
+            "refreshToken": refreshToken,
+            "expiresAt": Int((Date().timeIntervalSince1970 + expiresIn) * 1000.0),
+            "scopes": (result["scope"] as? String)?.components(separatedBy: " ")
+                ?? ["user:inference", "user:mcp_servers", "user:profile", "user:sessions:claude_code", "user:file_upload"],
+        ]
+        if let subscriptionType { oauthDict["subscriptionType"] = subscriptionType }
+        if let tier = organization["rate_limit_tier"] as? String { oauthDict["rateLimitTier"] = tier }
+        let tokenData = try JSONSerialization.data(withJSONObject: ["claudeAiOauth": oauthDict])
+        guard let tokenJSON = String(data: tokenData, encoding: .utf8) else {
+            throw ClaudeServiceError.oauthExchangeFailed("Token JSON encode failed")
+        }
+
+        // 4. Build oauthAccount for ~/.claude.json (field names mirror the CLI's).
+        // Nested dicts (e.g. ccOnboardingFlags) are deliberately omitted —
+        // AnyCodable can't encode raw [String: Any], and the CLI rewrites the
+        // full record on its own next login anyway.
+        var oauthAccount: [String: AnyCodable] = [:]
+        func put(_ key: String, _ value: Any?) {
+            guard let value, !(value is NSNull) else { return }
+            oauthAccount[key] = AnyCodable(value)
+        }
+        put("accountUuid", account["uuid"])
+        put("emailAddress", email)
+        put("displayName", account["display_name"] ?? account["full_name"])
+        put("accountCreatedAt", account["created_at"])
+        put("organizationUuid", organization["uuid"])
+        put("organizationName", organization["name"])
+        put("organizationType", organization["organization_type"])
+        put("billingType", organization["billing_type"])
+        put("organizationRateLimitTier", organization["rate_limit_tier"])
+        put("seatTier", organization["seat_tier"])
+        put("hasExtraUsageEnabled", organization["has_extra_usage_enabled"])
+        put("subscriptionCreatedAt", organization["subscription_created_at"])
+        put("claudeCodeTrialEndsAt", organization["claude_code_trial_ends_at"])
+        put("claudeCodeTrialDurationDays", organization["claude_code_trial_duration_days"])
+
+        // 5. Write both OS truth-source slots
+        let keychain = KeychainService.shared
+        guard keychain.writeClaudeToken(tokenJSON) else {
+            throw ClaudeServiceError.keychainWriteFailed
+        }
+        guard keychain.writeOAuthAccount(oauthAccount) else {
+            throw ClaudeServiceError.oauthAccountWriteFailed
+        }
+        log.info("[nativeOAuth] Login complete: \(email) (\(subscriptionType ?? "?"))")
+        return NativeLoginResult(email: email, orgName: orgName, subscriptionType: subscriptionType)
     }
+
+    private static func randomBytes(_ count: Int) -> Data {
+        var bytes = [UInt8](repeating: 0, count: count)
+        _ = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
+        return Data(bytes)
+    }
+
+    private static func base64URL(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+}
+
+// MARK: - Native OAuth Types
+
+/// In-flight native OAuth login: PKCE verifier + state + the authorize URL opened
+/// in the browser. Held by AppState between "open browser" and "paste code".
+struct PendingOAuth {
+    let codeVerifier: String
+    let state: String
+    let authorizeURL: URL
+}
+
+/// Identity captured by a completed native OAuth login.
+struct NativeLoginResult {
+    let email: String
+    let orgName: String?
+    let subscriptionType: String?
 }
 
 // MARK: - Errors
 
 enum ClaudeServiceError: LocalizedError {
-    case invalidOutput
-    case cliError(String)
-    case processLaunchFailed(Error)
     case noTokenForAccount(String)
     case keychainWriteFailed
     case oauthAccountWriteFailed
     case switchVerificationFailed
     case switchWrongAccount(expected: String, actual: String)
-    case loginTimeout
+    case invalidAuthCode(String)
+    case oauthExchangeFailed(String)
+    case profileFetchFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case .invalidOutput:
-            return "Invalid output from Claude CLI"
-        case .cliError(let msg):
-            return "Claude CLI error: \(msg)"
-        case .processLaunchFailed(let error):
-            return "Failed to launch Claude: \(error.localizedDescription)"
         case .noTokenForAccount:
             return "No stored backup for target account"
         case .keychainWriteFailed:
@@ -553,8 +526,12 @@ enum ClaudeServiceError: LocalizedError {
             return "Account switch verification failed"
         case .switchWrongAccount(let expected, let actual):
             return "Switch failed: expected \(expected) but got \(actual). Try removing and re-adding the account."
-        case .loginTimeout:
-            return "Login did not complete within 2 minutes. Please try again."
+        case .invalidAuthCode(let msg):
+            return "Invalid authorization code: \(msg)"
+        case .oauthExchangeFailed(let msg):
+            return "Sign-in failed: \(msg)"
+        case .profileFetchFailed(let msg):
+            return "Signed in, but could not fetch account profile (\(msg)). Please try again."
         }
     }
 }

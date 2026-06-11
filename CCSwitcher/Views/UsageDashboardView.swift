@@ -288,7 +288,7 @@ struct UsageDashboardView: View {
                 .foregroundStyle(.secondary)
             Spacer()
             Button {
-                Task { await appState.reauthenticateAccount(account) }
+                appState.startReauthenticate(account)
             } label: {
                 HStack(spacing: 3) {
                     Image(systemName: "arrow.triangle.2.circlepath")

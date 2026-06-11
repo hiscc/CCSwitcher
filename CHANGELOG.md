@@ -2,6 +2,41 @@
 
 ## Unreleased (current working changes)
 
+### refactor: subscriptionType 改为从 vault 推导，消除最后一处双源
+- `reconcileAccountsWithVault` 此前"保留"UserDefaults 里的 subscriptionType（注释称 vault 没有该字段——已过时：vault 的 token JSON 一直带 subscriptionType）。现在用 `extractSubscriptionType(backup.token)` 推导，vault 成为属主；仅当老 token JSON 缺字段时回退保留旧值
+- 至此 UserDefaults 中只剩 `lastUsed` 一个非派生字段，其余全部由 vault/OS 槽位单向推导
+
+### refactor: token 存取链路去冗余（零 fork 后的二次审计）
+- **统一过期预检**：`fetchOneAccountUsage` 此前只对非 active 账号做本地过期预检，active 账号的过期 token 必先挨一次 401 才进恢复分支。现在 active/非 active 统一预检 + 主动刷新，省掉每轮保底 401
+- **新增 `persistRefreshedToken(_:for:)`**：刷新后的 token 统一持久化——active → 写 OS keychain slot（CLI 直接受益，不再长期携带过期 accessToken）+ vault；非 active → 仅 vault。401 恢复路径的内联重复逻辑同步收编
+- **删除 switchAccount Step 5 re-capture**：其存在理由是"CLI 可能在 auth status 验证期间内部刷新 token"——验证已不 fork CLI，Step 3 写入和函数结束之间无任何 keychain 变更可能，re-capture 变成读回自己刚写的数据再存一遍的空转
+- **删除 `getAccountToken`**：无调用者的 legacy 函数
+- **防误改注释**：`KeychainService` 中"OS slot 走 `security` CLI、vault 走 SecItem API"的不对称是**刻意设计**——keychain ACL 按触碰 item 的二进制授信，app 用 SecItemAdd/Update 重写 CLI 的 item 会导致 CLI 下次读 token 弹权限框。补注释防止未来被"统一"掉
+
+### refactor: 彻底移除 CLI 进程依赖——app 不再 fork 任何 claude 子进程
+- 原生 OAuth 落地后全面审查：`getAuthStatus` 仍在 fork `claude auth status`，但其输出只是 keychain token + `~/.claude.json` oauthAccount 的转述——app 本就直接读写这两处（真相源原则）。fork CLI = 为已拥有的信息引入 Bun 崩溃面 + ~600ms 延迟
+- `getAuthStatus()` 改为同步直读 OS 真相源（keychain token 存在 + oauthAccount email → loggedIn；orgName 取自 oauthAccount；subscriptionType 取自 token JSON），不再 async/throws，三个调用点（performRefresh / addAccount / switchAccount Step 4 验证）同步简化，错误分支消失
+- `switchAccount` Step 4 验证从「fork CLI 确认」改为「回读自己刚写的两个槽位」——CLI 的 auth status 读的就是这两处，fork 它验证不了更多东西
+- 整体删除：`runClaude`（含 ProcessRef、双管道异步读取、取消处理）、`logout()`、`isClaudeAvailable()`、`cancelCurrentLogin`/`setLoginProcess`/`currentLoginProcess`、claudePath 发现逻辑（nvm/homebrew 路径扫描）、`@Published claudeAvailable`（无任何 View 消费）及其守卫
+- `ClaudeServiceError` 删除 `.invalidOutput`/`.cliError`/`.processLaunchFailed`；`AuthStatus` 去掉 Codable 和 authMethod/apiProvider/orgId（CLI JSON 解码专用，无消费者）
+- 架构终态：CCSwitcher = 文件读写（claude.json/vault）+ keychain（security CLI）+ HTTPS（oauth token/profile/usage）。Bun/CLI 的所有崩溃模式与 app 无关
+
+### feat: 登录改为 app 原生 OAuth（PKCE + 粘贴授权码），彻底移除 CLI 子进程依赖
+- 根因（结构性）：`claude auth login` 的 OAuth 流程要求 **CLI 子进程活到用户完成浏览器授权**（托管回调页把 code 转发回 CLI 的 localhost 监听端口）。在无 AVX 指令集的 CPU 上 Bun 随机崩溃（其自身启动即警告 strange crashes may occur），实测 app 内 spawn 的子进程 5 秒内 exit 1，code 无人接收 → keychain 永不更新 → 任何新账号都登不进。历史上的 "Login detected" 是 nil-token 比较假阳性
+- 方案：app 自己跑完整 OAuth authorization-code + PKCE 流程，**Bun/CLI 彻底移出登录关键路径**：
+  - `beginNativeOAuth()`：SecRandomCopyBytes 生成 PKCE verifier/challenge（CryptoKit SHA256）+ state，构造与 CLI 逐字段一致的授权 URL 并开浏览器
+  - 用户授权后托管页显示 code（`code#state` 格式），粘贴进 app 新增的输入框
+  - `completeNativeOAuth()`：校验 state 防串号 → POST `platform.claude.com/v1/oauth/token`（与 token refresh 同端点）换 token → GET `api.anthropic.com/api/oauth/profile` 拿身份/订阅 → 构造与 CLI 同构的 keychain token JSON（accessToken/refreshToken/expiresAt/scopes/subscriptionType/rateLimitTier）+ `~/.claude.json` oauthAccount → 双写
+- AppState：`loginNewAccount`/`reauthenticateAccount`（CLI 轮询版）删除，改为 `startLoginNewAccount`/`startReauthenticate`（开浏览器）+ `submitAuthCode`（粘贴完成）三段式；switchTo 的两处自动 re-auth 降级路径同步迁移
+- UI：`AccountSwitcherView` 的"Waiting for browser login..."盲等界面 → 授权码粘贴框 + Cancel / Reopen Page / Complete Login；失败保留 pending 状态可直接重贴重试
+- 删除：`login(previousEmail:)` 轮询函数、`loginTimeout` 错误 case；新增 `invalidAuthCode`/`oauthExchangeFailed`/`profileFetchFailed`
+
+### fix: runClaude 分离 stdout/stderr，修复 Bun 警告污染 JSON 导致登录/切换/刷新全失败
+- 根因：`runClaude` 把 `process.standardError` 和 `standardOutput` 指向**同一个 Pipe**，stderr 被合并进 stdout。Claude CLI 跑在 Bun 上，在缺少 AVX 指令集的 CPU 上每次启动都向 stderr 打印 `warn: CPU lacks AVX support...`，这两行文本被拼到 `auth status` 的 JSON 前面，`JSONDecoder` 解析失败抛 "isn't in the correct format"
+- 后果：`getAuthStatus()` 每次必抛错 → 登录轮询 60 次全失败 → "Login did not complete within 2 minutes"（但 keychain 里 OAuth 其实早已成功）；`switchAccount` Step 4 验证、`performRefresh`、`reauth` 同样被击穿
+- 修复：stderr 改用独立 `errPipe`（同样的非阻塞 readabilityHandler 收集），成功时只返回干净 stdout；非 0 退出时才把 stderr 拼进错误信息用于诊断（保留 login 的 "Opening browser" 文本检测）
+- 影响面：零行为语义改变，纯粹让输出不再被污染；一次修复同时恢复 login / switch / refresh / reauth
+
 ### refactor: 合并三个 usage dict 为 `UsageState` enum（架构第四步）
 - 新增 `UsageState` enum（`.fresh` / `.stale` / `.rateLimited` / `.expired` / `.missing`）作为 per-account usage 的单一 model
 - 删除 `@Published var accountUsage` / `accountUsageErrors` 两个 dict + `UsageErrorState` struct，合并为 `@Published var usage: [UUID: UsageState]`

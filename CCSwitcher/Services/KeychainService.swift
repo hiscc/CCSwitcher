@@ -83,6 +83,14 @@ final class KeychainService: Sendable {
     }
 
     // MARK: - Claude Code Token Operations (keychain via `security` CLI)
+    //
+    // DELIBERATE asymmetry: the CLI's token item is accessed by forking
+    // /usr/bin/security, while our own vault (below) uses the native SecItem
+    // API. Keychain ACLs trust the binary that touches an item — rewriting the
+    // CLI's item via SecItemAdd/Update from this app would re-own it, and the
+    // *CLI* would then hit "wants to access keychain" prompts on its next read.
+    // `security add-generic-password -U` keeps the access path the CLI expects.
+    // /usr/bin/security is an Apple system binary — none of Bun's fragility.
 
     func readClaudeToken() -> String? {
         let token = runSecurity(args: [
@@ -200,11 +208,6 @@ final class KeychainService: Sendable {
         var store = loadBackupStore()
         store.removeValue(forKey: accountId)
         return saveBackupStore(store)
-    }
-
-    // Legacy compatibility — read token string only (for diagnostics)
-    func getAccountToken(forAccountId accountId: String) -> String? {
-        return getAccountBackup(forAccountId: accountId)?.token
     }
 
     // MARK: - App Keychain operations (Backups)
