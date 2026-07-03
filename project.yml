@@ -45,3 +45,25 @@ targets:
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
     entitlements:
       path: CCSwitcher/Resources/CCSwitcher.entitlements
+
+  CCSwitcherTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: CCSwitcherTests
+      # 纯逻辑测试：被测文件直接编入测试模块（不 @testable import app、不挂 TEST_HOST）
+      - path: CCSwitcher/Services/KeychainService.swift
+      - path: CCSwitcher/Services/FileLogger.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: me.xueshi.ccswitcher.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  CCSwitcher:
+    build:
+      targets:
+        CCSwitcher: all
+    test:
+      targets:
+        - CCSwitcherTests
