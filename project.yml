@@ -52,6 +52,7 @@ targets:
     sources:
       - path: CCSwitcherTests
       # 纯逻辑测试：被测文件直接编入测试模块（不 @testable import app、不挂 TEST_HOST）
+      - path: CCSwitcher/Services/RelaySettingsService.swift
       - path: CCSwitcher/Services/KeychainService.swift
       - path: CCSwitcher/Services/FileLogger.swift
     settings:
