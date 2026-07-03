@@ -58,6 +58,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: me.xueshi.ccswitcher.tests
         GENERATE_INFOPLIST_FILE: YES
+        # 显式清空——本 target 绝不挂 test host（否则测试进程=app 进程，会碰真实 keychain）
+        BUNDLE_LOADER: ""
+        TEST_HOST: ""
 
 schemes:
   CCSwitcher:
