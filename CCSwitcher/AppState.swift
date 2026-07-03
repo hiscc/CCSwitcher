@@ -45,6 +45,7 @@ final class AppState: ObservableObject {
     private let costParser = CostParser.shared
     private let activityParser = ActivityParser.shared
     private let keychain = KeychainService.shared
+    private let relaySettings = RelaySettingsService.shared
 
     private let accountsKey = "com.ccswitcher.accounts"
     private let usageCacheKey = "com.ccswitcher.usageCache"
@@ -102,6 +103,30 @@ final class AppState: ObservableObject {
 
         // 2. Update existing + add missing
         for (id, backup) in vaultIds {
+            if let relay = backup.relay {
+                let host = URL(string: relay.baseURL)?.host ?? relay.baseURL
+                if let idx = accounts.firstIndex(where: { $0.id == id }) {
+                    accounts[idx].email = host
+                    accounts[idx].displayName = relay.name
+                    accounts[idx].orgName = nil
+                    accounts[idx].subscriptionType = nil
+                    accounts[idx].baseURL = relay.baseURL
+                } else {
+                    accounts.append(Account(
+                        id: id,
+                        email: host,
+                        displayName: relay.name,
+                        provider: .claudeCode,
+                        orgName: nil,
+                        subscriptionType: nil,
+                        isActive: false,
+                        lastUsed: nil,
+                        baseURL: relay.baseURL
+                    ))
+                    log.info("[reconcile] Added relay \(relay.name) (id=\(id)) from vault")
+                }
+                continue
+            }
             let oauth = backup.oauthAccount
             let email = (oauth["emailAddress"]?.value as? String) ?? ""
             let orgName = oauth["organizationName"]?.value as? String
@@ -291,6 +316,65 @@ final class AppState: ObservableObject {
         log.info("[addAccount] Account saved. Total accounts: \(self.accounts.count)")
     }
 
+    /// Add a relay-station account (baseURL + API token). Returns true on success.
+    @discardableResult
+    func addRelayAccount(name: String, baseURL: String, token: String) -> Bool {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = RelaySettingsService.normalizeBaseURL(baseURL)
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedName.isEmpty else { errorMessage = "Relay name is required"; return false }
+        guard normalized.hasPrefix("https://") || normalized.hasPrefix("http://") else {
+            errorMessage = "Base URL must start with http(s)://"
+            return false
+        }
+        guard !trimmedToken.isEmpty else { errorMessage = "Token is required"; return false }
+
+        // Same base + same token = duplicate. Same base + different token is fine
+        // (one station, multiple channels — e.g. xtoken's five claude channels).
+        let vault = keychain.allBackups()
+        if accounts.contains(where: { acc in
+            acc.isRelay && acc.baseURL == normalized && vault[acc.id.uuidString]?.token == trimmedToken
+        }) {
+            errorMessage = "This relay token is already added"
+            return false
+        }
+
+        let host = URL(string: normalized)?.host ?? normalized
+        let account = Account(
+            email: host,
+            displayName: trimmedName,
+            provider: .claudeCode,
+            orgName: nil,
+            subscriptionType: nil,
+            isActive: false,
+            baseURL: normalized
+        )
+        guard keychain.saveRelayBackup(
+            token: trimmedToken,
+            relay: RelayInfo(name: trimmedName, baseURL: normalized),
+            forAccountId: account.id.uuidString
+        ) else {
+            errorMessage = "Could not save relay credentials"
+            return false
+        }
+        accounts.append(account)
+        saveAccounts()
+        errorMessage = nil
+        log.info("[addRelay] Added \(trimmedName) (\(normalized)). Total: \(self.accounts.count)")
+        return true
+    }
+
+    /// Probe a relay before saving. Returns a user-facing result line.
+    func testRelay(baseURL: String, token: String) async -> String {
+        let normalized = RelaySettingsService.normalizeBaseURL(baseURL)
+        let result = await claudeService.testRelayConnection(
+            baseURL: normalized,
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        return (result.ok ? "✓ " : "✗ ") + result.message
+    }
+
     // MARK: - Browser Login (native OAuth — no CLI in the critical path)
 
     private var pendingOAuth: PendingOAuth?
@@ -423,15 +507,22 @@ final class AppState: ObservableObject {
         if account.isActive, let target = accounts.first(where: { $0.id != account.id }) {
             log.info("[removeAccount] Active account being removed; switching OS slot to \(target.email) first")
             await switchTo(target)
-            // Verify the OS slot actually moved by reading the truth source (~/.claude.json).
-            // Don't infer from errorMessage — that's brittle and can match by coincidence.
-            // ClaudeService.switchAccount rolls back keychain on failure, so a non-target
-            // email here means we'd be deleting an account the CLI is still using.
-            let liveEmail = (keychain.readOAuthAccount()?["emailAddress"]?.value as? String) ?? ""
-            if liveEmail != target.email {
-                log.error("[removeAccount] OS slot still points at \(liveEmail) (expected \(target.email)); aborting deletion to keep state consistent")
+            // Verify the OS slot actually moved by reading the matching truth source.
+            let moved: Bool
+            if target.isRelay {
+                moved = relaySettings.readRelayEnv()?.baseURL == target.baseURL
+            } else {
+                let liveEmail = (keychain.readOAuthAccount()?["emailAddress"]?.value as? String) ?? ""
+                moved = liveEmail == target.email
+            }
+            if !moved {
+                log.error("[removeAccount] OS slot did not move to \(target.email); aborting deletion to keep state consistent")
                 return
             }
+        } else if account.isActive, account.isRelay {
+            // Removing the last remaining account while it's an active relay: clear
+            // the env keys so the CLI doesn't keep routing to deleted credentials.
+            _ = relaySettings.clearRelayEnv()
         }
 
         keychain.removeAccountBackup(forAccountId: account.id.uuidString)
@@ -450,43 +541,55 @@ final class AppState: ObservableObject {
     }
 
     func switchTo(_ account: Account) async {
-        guard let currentActive = activeAccount, currentActive.id != account.id else {
-            log.info("[switchTo] No switch needed (same account or no active account)")
+        guard !isLoading else {
+            log.info("[switchTo] Ignored: a switch/refresh is already in flight")
             return
         }
+        guard activeAccount?.id != account.id else {
+            log.info("[switchTo] No switch needed (already active)")
+            return
+        }
+        // May be nil (e.g. unmanaged relay env / external logout) — switching out of
+        // a no-active state must still work.
+        let currentActive = activeAccount
 
-        log.info("[switchTo] ===== Switching from \(currentActive.email) to \(account.email) =====")
+        log.info("[switchTo] ===== Switching from \(currentActive?.email ?? "none") to \(account.email) =====")
 
-        // Pre-switch: verify target has a backup with matching email
+        // Pre-switch: verify target has a backup
         guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) else {
             log.error("[switchTo] ABORT: no backup for target account")
-            errorMessage = "No stored credentials for \(account.email). Use re-authenticate to fix."
-            return
-        }
-        let backupEmail = (backup.oauthAccount["emailAddress"]?.value as? String) ?? ""
-        if !backupEmail.isEmpty && backupEmail != account.email {
-            log.error("[switchTo] ABORT: backup email (\(backupEmail)) != target (\(account.email)) — corrupted backup, needs re-auth")
-            errorMessage = "Stored credentials belong to \(backupEmail), not \(account.email). Sign in again to fix."
-            startReauthenticate(account)
+            errorMessage = account.isRelay
+                ? "No stored token for \(account.displayName). Remove and re-add the relay."
+                : "No stored credentials for \(account.email). Use re-authenticate to fix."
             return
         }
 
-        // If token is expired, try auto-refresh first; fall back to re-auth only if refresh fails
-        if ClaudeService.isTokenExpired(backup.token) {
-            log.warning("[switchTo] Target token expired for \(account.email), attempting auto-refresh...")
-            if let refreshedJSON = await claudeService.refreshAccessToken(tokenJSON: backup.token) {
-                log.info("[switchTo] Token refreshed for \(account.email), updating backup and proceeding")
-                keychain.saveAccountBackup(
-                    token: refreshedJSON,
-                    oauthAccount: backup.oauthAccount,
-                    forAccountId: account.id.uuidString
-                )
-                // Continue with the switch using refreshed token (don't return)
-            } else {
-                log.warning("[switchTo] Auto-refresh failed for \(account.email), falling back to re-auth")
-                errorMessage = "Token expired for \(account.email). Sign in again to continue."
+        if !account.isRelay {
+            // Official-only checks: relay tokens are opaque API keys — no email
+            // identity to compare, no expiry JSON to parse, nothing to refresh.
+            let backupEmail = (backup.oauthAccount["emailAddress"]?.value as? String) ?? ""
+            if !backupEmail.isEmpty && backupEmail != account.email {
+                log.error("[switchTo] ABORT: backup email (\(backupEmail)) != target (\(account.email)) — corrupted backup, needs re-auth")
+                errorMessage = "Stored credentials belong to \(backupEmail), not \(account.email). Sign in again to fix."
                 startReauthenticate(account)
                 return
+            }
+
+            if ClaudeService.isTokenExpired(backup.token) {
+                log.warning("[switchTo] Target token expired for \(account.email), attempting auto-refresh...")
+                if let refreshedJSON = await claudeService.refreshAccessToken(tokenJSON: backup.token) {
+                    log.info("[switchTo] Token refreshed for \(account.email), updating backup and proceeding")
+                    keychain.saveAccountBackup(
+                        token: refreshedJSON,
+                        oauthAccount: backup.oauthAccount,
+                        forAccountId: account.id.uuidString
+                    )
+                } else {
+                    log.warning("[switchTo] Auto-refresh failed for \(account.email), falling back to re-auth")
+                    errorMessage = "Token expired for \(account.email). Sign in again to continue."
+                    startReauthenticate(account)
+                    return
+                }
             }
         }
 
@@ -587,7 +690,7 @@ final class AppState: ObservableObject {
     private func fetchAllAccountUsage() async {
         // Snapshot the account list at the start so reentrant mutations (e.g. removeAccount
         // during an await) can't change the iteration order or stagger decision mid-flight.
-        let snapshot = accounts
+        let snapshot = accounts.filter { !$0.isRelay }   // relays have no usage API
         var newUsage: [UUID: UsageState] = [:]
         var newCache = cachedUsage
 
@@ -721,7 +824,7 @@ final class AppState: ObservableObject {
         }
 
         // Check each account has a backup
-        for account in accounts {
+        for account in accounts where !account.isRelay {
             if let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString) {
                 let backupEmail = (backup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
                 log.info("[diagnose] Backup [\(account.email)]: OK (email=\(backupEmail))")
@@ -771,6 +874,28 @@ final class AppState: ObservableObject {
     }
 
     private func updateActiveAccount(from status: AuthStatus) {
+        // Relay env takes precedence: when the keys are present the CLI routes to
+        // the relay regardless of the OAuth slots.
+        if let relay = status.relayEnv {
+            let vault = keychain.allBackups()
+            if let match = accounts.first(where: { account in
+                guard account.isRelay,
+                      let backup = vault[account.id.uuidString],
+                      let info = backup.relay else { return false }
+                return info.baseURL == relay.baseURL && backup.token == relay.token
+            }) {
+                setActiveAccount(id: match.id)
+                saveAccounts()
+                log.info("[updateActiveAccount] Relay env matches \(match.displayName)")
+            } else {
+                // Same precedent as "logged-in account we don't manage": don't lie.
+                log.info("[updateActiveAccount] Relay env present but unmanaged (\(relay.baseURL)) — clearing active state")
+                setActiveAccount(id: nil)
+                saveAccounts()
+            }
+            return
+        }
+
         // CLI says no one is logged in (e.g. user ran `claude auth logout` externally).
         // Clear our active state so UI doesn't keep showing a phantom active account.
         guard status.loggedIn, let email = status.email else {
