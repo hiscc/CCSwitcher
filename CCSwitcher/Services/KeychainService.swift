@@ -179,6 +179,13 @@ final class KeychainService: Sendable {
         backupLock.lock()
         defer { backupLock.unlock() }
         var store = loadBackupStore()
+        // This function captures OFFICIAL OAuth credentials. Writing them over a
+        // relay entry would corrupt the vault (relay identity lost, token replaced
+        // by an OAuth JSON) — refuse. Relay entries are written by saveRelayBackup.
+        if store[accountId]?.relay != nil {
+            log.error("[saveBackup] REFUSED: \(accountId) is a relay entry — use saveRelayBackup")
+            return false
+        }
         store[accountId] = AccountBackup(token: token, oauthAccount: oauthAccount)
         let result = saveBackupStore(store)
         log.info("[saveBackup] Result: \(result)")

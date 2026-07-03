@@ -21,6 +21,19 @@ final class AccountBackupTests: XCTestCase {
         XCTAssertEqual(decoded.relay, RelayInfo(name: "xtoken 0.18", baseURL: "https://api.xtokenmirror.com"))
     }
 
+    func testNilRelayIsOmittedFromJSON() throws {
+        let backup = AccountBackup(token: "t", oauthAccount: [:])
+        let data = try JSONEncoder().encode(backup)
+        let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        XCTAssertNil(json["relay"], "nil relay must be absent from JSON, not \"relay\":null")
+    }
+
+    func testExplicitNullRelayDecodesAsNil() throws {
+        let json = #"{"token":"t","oauthAccount":{},"relay":null}"#
+        let backup = try JSONDecoder().decode(AccountBackup.self, from: Data(json.utf8))
+        XCTAssertNil(backup.relay)
+    }
+
     func testMixedStoreDecodes() throws {
         let json = #"""
         {"A":{"token":"t1","oauthAccount":{"emailAddress":"a@b.c"}},
