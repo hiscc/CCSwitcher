@@ -20,6 +20,12 @@ final class ClaudeService: @unchecked Sendable {
     /// the CLI's `auth status` reads. Forking the CLI here added a Bun runtime
     /// dependency (and its crash modes) for information the app already owns.
     func getAuthStatus() -> AuthStatus {
+        // Relay env takes precedence: when both keys are present the CLI routes to
+        // the relay (verified 2026-07-03: bogus token → 401, no OAuth fallback).
+        if let relay = RelaySettingsService.shared.readRelayEnv() {
+            log.info("[getAuthStatus] Relay env active: \(relay.baseURL)")
+            return AuthStatus(loggedIn: false, email: nil, orgName: nil, subscriptionType: nil, relayEnv: relay)
+        }
         let keychain = KeychainService.shared
         guard let tokenJSON = keychain.readClaudeToken(),
               let oauthAccount = keychain.readOAuthAccount(),

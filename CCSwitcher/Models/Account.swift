@@ -37,6 +37,10 @@ struct Account: Identifiable, Codable, Hashable {
     var subscriptionType: String?
     var isActive: Bool
     var lastUsed: Date?
+    /// Relay station base URL. nil = official OAuth account.
+    var baseURL: String?
+
+    var isRelay: Bool { baseURL != nil }
 
     var obfuscatedEmail: String {
         return email
@@ -54,7 +58,8 @@ struct Account: Identifiable, Codable, Hashable {
         orgName: String? = nil,
         subscriptionType: String? = nil,
         isActive: Bool = false,
-        lastUsed: Date? = nil
+        lastUsed: Date? = nil,
+        baseURL: String? = nil
     ) {
         self.id = id
         self.email = email
@@ -64,15 +69,20 @@ struct Account: Identifiable, Codable, Hashable {
         self.subscriptionType = subscriptionType
         self.isActive = isActive
         self.lastUsed = lastUsed
+        self.baseURL = baseURL
     }
 }
 
 // MARK: - Auth Status
 
-/// Auth state derived from the OS truth sources (keychain token + ~/.claude.json oauthAccount).
+/// Auth state derived from the OS truth sources (keychain token + ~/.claude.json
+/// oauthAccount + settings.json relay env).
 struct AuthStatus {
     let loggedIn: Bool
     let email: String?
     let orgName: String?
     let subscriptionType: String?
+    /// Relay env present in ~/.claude/settings.json. Non-nil = the CLI routes to
+    /// the relay; OAuth slots are cleared on relay switch (mutual exclusion).
+    var relayEnv: RelayEnv? = nil
 }

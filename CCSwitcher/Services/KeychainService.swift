@@ -133,6 +133,19 @@ final class KeychainService: Sendable {
         return result
     }
 
+    /// Remove the CLI's token item. Returns true when the item is verifiably gone
+    /// (delete of an already-absent item also counts as success).
+    func deleteClaudeToken() -> Bool {
+        _ = runSecurityStatus(args: [
+            "delete-generic-password",
+            "-s", claudeService,
+            "-a", claudeAccount
+        ])
+        let gone = readClaudeToken() == nil
+        log.info("[deleteClaudeToken] gone=\(gone)")
+        return gone
+    }
+
     // MARK: - ~/.claude.json oauthAccount Operations
 
     func readOAuthAccount() -> [String: AnyCodable]? {
@@ -171,6 +184,28 @@ final class KeychainService: Sendable {
         }
     }
 
+    /// Remove oauthAccount from ~/.claude.json (relay active = no OAuth identity).
+    func removeOAuthAccount() -> Bool {
+        guard let data = FileManager.default.contents(atPath: claudeJsonPath),
+              var json = try? JSONDecoder().decode([String: AnyCodable].self, from: data) else {
+            log.error("[removeOAuthAccount] Failed to read \(claudeJsonPath)")
+            return false
+        }
+        guard json["oauthAccount"] != nil else { return true }
+        json.removeValue(forKey: "oauthAccount")
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let newData = try encoder.encode(json)
+            try newData.write(to: URL(fileURLWithPath: claudeJsonPath), options: .atomic)
+            log.info("[removeOAuthAccount] Removed")
+            return true
+        } catch {
+            log.error("[removeOAuthAccount] Failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     // MARK: - Account Backup Operations (token + oauthAccount)
 
     func saveAccountBackup(token: String, oauthAccount: [String: AnyCodable], forAccountId accountId: String) -> Bool {
@@ -190,6 +225,16 @@ final class KeychainService: Sendable {
         let result = saveBackupStore(store)
         log.info("[saveBackup] Result: \(result)")
         return result
+    }
+
+    /// Store a relay entry in the vault (token = relay API key, no oauthAccount).
+    func saveRelayBackup(token: String, relay: RelayInfo, forAccountId accountId: String) -> Bool {
+        log.info("[saveRelayBackup] Saving \(relay.name) (\(relay.baseURL)) for \(accountId)")
+        backupLock.lock()
+        defer { backupLock.unlock() }
+        var store = loadBackupStore()
+        store[accountId] = AccountBackup(token: token, oauthAccount: [:], relay: relay)
+        return saveBackupStore(store)
     }
 
     func getAccountBackup(forAccountId accountId: String) -> AccountBackup? {
