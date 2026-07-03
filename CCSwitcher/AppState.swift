@@ -141,6 +141,7 @@ final class AppState: ObservableObject {
                 accounts[idx].email = email
                 accounts[idx].orgName = orgName
                 accounts[idx].displayName = orgName ?? email
+                accounts[idx].baseURL = nil
                 if let subscriptionType {
                     accounts[idx].subscriptionType = subscriptionType
                 }
@@ -365,14 +366,13 @@ final class AppState: ObservableObject {
         return true
     }
 
-    /// Probe a relay before saving. Returns a user-facing result line.
-    func testRelay(baseURL: String, token: String) async -> String {
+    /// Probe a relay before saving. The view decides how to render ok/failure.
+    func testRelay(baseURL: String, token: String) async -> ClaudeService.RelayTestResult {
         let normalized = RelaySettingsService.normalizeBaseURL(baseURL)
-        let result = await claudeService.testRelayConnection(
+        return await claudeService.testRelayConnection(
             baseURL: normalized,
             token: token.trimmingCharacters(in: .whitespacesAndNewlines)
         )
-        return (result.ok ? "✓ " : "✗ ") + result.message
     }
 
     // MARK: - Browser Login (native OAuth — no CLI in the critical path)
@@ -517,6 +517,7 @@ final class AppState: ObservableObject {
             }
             if !moved {
                 log.error("[removeAccount] OS slot did not move to \(target.email); aborting deletion to keep state consistent")
+                errorMessage = "Couldn't switch off \(account.displayName) — account not removed. Try again."
                 return
             }
         } else if account.isActive, account.isRelay {
@@ -543,6 +544,7 @@ final class AppState: ObservableObject {
     func switchTo(_ account: Account) async {
         guard !isLoading else {
             log.info("[switchTo] Ignored: a switch/refresh is already in flight")
+            errorMessage = "Busy refreshing — try again in a moment."
             return
         }
         guard activeAccount?.id != account.id else {
