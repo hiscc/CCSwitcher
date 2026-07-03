@@ -93,5 +93,43 @@ final class RelaySettingsServiceTests: XCTestCase {
         XCTAssertEqual(RelaySettingsService.normalizeBaseURL("  https://x.y/v1 "), "https://x.y")
         // 深路径保留（有的中转在子路径提供 Anthropic 协议）
         XCTAssertEqual(RelaySettingsService.normalizeBaseURL("https://open.bigmodel.cn/api/anthropic"), "https://open.bigmodel.cn/api/anthropic")
+        XCTAssertEqual(RelaySettingsService.normalizeBaseURL("https://x.y/V1"), "https://x.y")
+        XCTAssertEqual(RelaySettingsService.normalizeBaseURL("https://apiv1.example"), "https://apiv1.example")
+        XCTAssertEqual(RelaySettingsService.normalizeBaseURL("https://x.y/v1/v1"), "https://x.y/v1")
+        XCTAssertEqual(RelaySettingsService.normalizeBaseURL(""), "")
+    }
+
+    func testWritePreservesNonStringValueFidelity() {
+        seed(#"""
+        {"env":{"MCP_TIMEOUT":"300000"},
+         "skipDangerousModePermissionPrompt":true,
+         "cleanupPeriodDays":30,
+         "effortRatio":1.5,
+         "legacyField":null,
+         "hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","timeout":5}]}]},
+         "nested":{"a":[1,true,null,{"k":0.1}]}}
+        """#)
+        XCTAssertTrue(svc.writeRelayEnv(RelayEnv(baseURL: "https://r.example", token: "sk-abc")))
+        let json = fileJSON()
+        XCTAssertEqual(json["skipDangerousModePermissionPrompt"] as? Bool, true)
+        XCTAssertEqual(json["cleanupPeriodDays"] as? Int, 30)
+        XCTAssertEqual(json["effortRatio"] as? Double, 1.5)
+        XCTAssertTrue(json["legacyField"] is NSNull)
+        let hooks = json["hooks"] as! [String: Any]
+        let submitHooks = (hooks["UserPromptSubmit"] as! [[String: Any]])[0]["hooks"] as! [[String: Any]]
+        XCTAssertEqual(submitHooks[0]["type"] as? String, "command")
+        XCTAssertEqual(submitHooks[0]["timeout"] as? Int, 5)
+        let nestedA = (json["nested"] as! [String: Any])["a"] as! [Any]
+        XCTAssertEqual(nestedA[0] as? Int, 1)
+        XCTAssertEqual(nestedA[1] as? Bool, true)
+        XCTAssertTrue(nestedA[2] is NSNull)
+        XCTAssertEqual((nestedA[3] as? [String: Any])?["k"] as? Double, 0.1)
+    }
+
+    func testWriteRefusesWhenEnvIsNotObject() {
+        seed(#"{"env":5,"model":"opus"}"#)
+        XCTAssertFalse(svc.writeRelayEnv(RelayEnv(baseURL: "https://r.example", token: "sk-abc")))
+        XCTAssertEqual(fileJSON()["model"] as? String, "opus")
+        XCTAssertEqual(fileJSON()["env"] as? Int, 5)
     }
 }

@@ -13,6 +13,7 @@ struct RelayEnv: Equatable {
 /// ~/.claude/settings.json. Strictly read-modify-write: every other key in the
 /// file (hooks, permissions, plugins, ...) passes through untouched. A file we
 /// can't parse is NEVER overwritten — it holds the user's whole CC setup.
+/// Note: values round-trip via AnyCodable — integers beyond Int64 would lose precision (not reachable in real CC settings).
 final class RelaySettingsService: Sendable {
     static let shared = RelaySettingsService()
 
@@ -20,6 +21,7 @@ final class RelaySettingsService: Sendable {
     private static let authTokenKey = "ANTHROPIC_AUTH_TOKEN"
 
     private let settingsPath: String
+    private let ioLock = NSLock()
 
     init(settingsPath: String = NSHomeDirectory() + "/.claude/settings.json") {
         self.settingsPath = settingsPath
@@ -77,7 +79,10 @@ final class RelaySettingsService: Sendable {
         return try? JSONDecoder().decode([String: AnyCodable].self, from: data)
     }
 
+    // No cross-process lock: if Claude Code rewrites settings.json between our read and write, last writer wins (window ~ms; both sides write rarely; blast radius = one reverted external edit).
     private func mutateEnv(_ mutate: (inout [String: AnyCodable]) -> Void) -> Bool {
+        ioLock.lock()
+        defer { ioLock.unlock() }
         var json: [String: AnyCodable]
         if FileManager.default.fileExists(atPath: settingsPath) {
             guard let parsed = readSettings() else {
@@ -89,6 +94,11 @@ final class RelaySettingsService: Sendable {
             json = [:]
         }
 
+        // "env" we don't own as an object → refuse rather than clobber a key type we don't understand
+        if let existing = json["env"], !(existing.value is [String: AnyCodable]), !(existing.value is NSNull) {
+            log.error("[mutateEnv] settings.json 'env' exists but is not an object — refusing to overwrite")
+            return false
+        }
         var env = (json["env"]?.value as? [String: AnyCodable]) ?? [:]
         mutate(&env)
         json["env"] = AnyCodable(env)
