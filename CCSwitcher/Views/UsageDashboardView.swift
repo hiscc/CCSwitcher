@@ -35,7 +35,7 @@ struct UsageDashboardView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)
-                } else if appState.usage.isEmpty {
+                } else if appState.accounts.isEmpty {
                     VStack(spacing: 12) {
                         Image(systemName: "chart.bar.xaxis")
                             .font(.system(size: 32))

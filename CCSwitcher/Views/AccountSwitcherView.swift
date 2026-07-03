@@ -286,9 +286,11 @@ struct AccountSwitcherView: View {
             TextField("Base URL (e.g. https://api.xtokenmirror.com)", text: $relayBaseURL)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
+                .onChange(of: relayBaseURL) { _, _ in relayTestResult = nil }
             TextField("Token (sk-...)", text: $relayToken)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
+                .onChange(of: relayToken) { _, _ in relayTestResult = nil }
 
             if let result = relayTestResult {
                 Text((result.ok ? "✓ " : "✗ ") + result.message)
