@@ -6,6 +6,12 @@ struct AccountSwitcherView: View {
     @State private var showingAddConfirm = false
     @State private var authCode = ""
     @State private var isSubmittingCode = false
+    @State private var showingAddRelay = false
+    @State private var relayName = ""
+    @State private var relayBaseURL = ""
+    @State private var relayToken = ""
+    @State private var relayTestResult: ClaudeService.RelayTestResult?
+    @State private var isTestingRelay = false
 
     var body: some View {
         ScrollView {
@@ -49,7 +55,7 @@ struct AccountSwitcherView: View {
     private func accountRow(_ account: Account) -> some View {
         HStack(spacing: 12) {
             // Provider icon
-            Image(systemName: account.provider.iconName)
+            Image(systemName: account.isRelay ? "network" : account.provider.iconName)
                 .font(.title2)
                 .foregroundStyle(account.isActive ? .brand : .secondary)
                 .frame(width: 32, height: 32)
@@ -80,7 +86,7 @@ struct AccountSwitcherView: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
-                    Text(account.provider.rawValue)
+                    Text(account.isRelay ? "Relay" : account.provider.rawValue)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -96,17 +102,20 @@ struct AccountSwitcherView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .tint(.brand)
+                .disabled(appState.isLoading)
             }
 
-            Button {
-                appState.startReauthenticate(account)
-            } label: {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+            if !account.isRelay {
+                Button {
+                    appState.startReauthenticate(account)
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                .buttonStyle(.plain)
+                .help("Re-authenticate (fix stale token)")
             }
-            .buttonStyle(.plain)
-            .help("Re-authenticate (fix stale token)")
 
             Button {
                 Task { await appState.removeAccount(account) }
@@ -194,6 +203,8 @@ struct AccountSwitcherView: View {
                     .fill(.cardFillStrong)
                     .strokeBorder(.cardBorderBrand, lineWidth: 1)
             )
+        } else if showingAddRelay {
+            relayForm
         } else if showingAddConfirm {
             // Inline confirmation for "Add Current"
             VStack(spacing: 8) {
@@ -248,7 +259,94 @@ struct AccountSwitcherView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+
+                Button {
+                    withAnimation { showingAddRelay = true }
+                } label: {
+                    Label("Add Relay Station", systemImage: "network")
+                        .font(.caption)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
         }
+    }
+
+    // MARK: - Relay Form
+
+    private var relayForm: some View {
+        VStack(spacing: 8) {
+            Text("Add Relay Station")
+                .font(.caption.weight(.medium))
+
+            TextField("Name (e.g. xtoken claude0.18)", text: $relayName)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+            TextField("Base URL (e.g. https://api.xtokenmirror.com)", text: $relayBaseURL)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+            TextField("Token (sk-...)", text: $relayToken)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+
+            if let result = relayTestResult {
+                Text((result.ok ? "✓ " : "✗ ") + result.message)
+                    .font(.caption2)
+                    .foregroundStyle(result.ok ? .green : .red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 8) {
+                Button("Cancel") {
+                    withAnimation { showingAddRelay = false }
+                    clearRelayForm()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    isTestingRelay = true
+                    relayTestResult = nil
+                    Task {
+                        relayTestResult = await appState.testRelay(baseURL: relayBaseURL, token: relayToken)
+                        isTestingRelay = false
+                    }
+                } label: {
+                    if isTestingRelay {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Text("Test")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isTestingRelay || relayBaseURL.isEmpty || relayToken.isEmpty)
+
+                Button("Save") {
+                    if appState.addRelayAccount(name: relayName, baseURL: relayBaseURL, token: relayToken) {
+                        withAnimation { showingAddRelay = false }
+                        clearRelayForm()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.brand)
+                .controlSize(.small)
+                .disabled(relayName.isEmpty || relayBaseURL.isEmpty || relayToken.isEmpty)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(.cardFillStrong)
+                .strokeBorder(.cardBorderBrand, lineWidth: 1)
+        )
+    }
+
+    private func clearRelayForm() {
+        relayName = ""
+        relayBaseURL = ""
+        relayToken = ""
+        relayTestResult = nil
     }
 }

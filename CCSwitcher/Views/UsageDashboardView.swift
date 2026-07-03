@@ -204,7 +204,9 @@ struct UsageDashboardView: View {
     private func accountUsageCard(account: Account, state: UsageState?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             accountHeader(account)
-            if let usage = state?.usage {
+            if account.isRelay {
+                relayInfoRow
+            } else if let usage = state?.usage {
                 usageBars(usage, isRateLimited: state?.isRateLimited ?? false)
                 extraUsageRow(usage.extraUsage)
             } else if let state, state.isExpired {
@@ -223,7 +225,7 @@ struct UsageDashboardView: View {
         .padding(.horizontal, 16)
         .contentShape(Rectangle())
         .onTapGesture {
-            if !account.isActive {
+            if !account.isActive && !appState.isLoading {
                 Task { await appState.switchTo(account) }
             }
         }
@@ -260,6 +262,27 @@ struct UsageDashboardView: View {
                     .padding(.vertical, 1)
                     .background(.subtleBrand, in: Capsule())
             }
+
+            if account.isRelay {
+                Text("Relay")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.gray.opacity(0.15), in: Capsule())
+            }
+        }
+    }
+
+    private var relayInfoRow: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "network")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Relay station — no usage data")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Spacer()
         }
     }
 
