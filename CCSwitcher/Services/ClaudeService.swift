@@ -206,81 +206,144 @@ final class ClaudeService: @unchecked Sendable {
         }
     }
 
+    // MARK: - Relay Probe
+
+    struct RelayTestResult {
+        let ok: Bool
+        let message: String
+    }
+
+    /// Probe {base}/v1/messages with a 1-token request. Verifies connectivity + auth.
+    /// Does NOT verify tool-calling passthrough (which the CLI depends on) — some
+    /// relay channels degrade forced tool calls; that only shows up in real use.
+    func testRelayConnection(baseURL: String, token: String) async -> RelayTestResult {
+        guard let url = URL(string: baseURL + "/v1/messages") else {
+            return RelayTestResult(ok: false, message: "Invalid base URL")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let body: [String: Any] = [
+            "model": "claude-opus-4-8",
+            "max_tokens": 1,
+            "messages": [["role": "user", "content": "hi"]]
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let snippet = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
+            log.info("[testRelay] \(baseURL) → HTTP \(code)")
+            switch code {
+            case 200:
+                return RelayTestResult(ok: true, message: "Connected — token accepted")
+            case 401, 403:
+                return RelayTestResult(ok: false, message: "Token rejected (HTTP \(code))")
+            case 404:
+                return RelayTestResult(ok: false, message: "No /v1/messages at this base URL (HTTP 404)")
+            default:
+                return RelayTestResult(ok: false, message: "HTTP \(code): \(snippet)")
+            }
+        } catch {
+            return RelayTestResult(ok: false, message: "Network error: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Account Switching
 
-    func switchAccount(from currentAccount: Account, to targetAccount: Account) async throws {
+    func switchAccount(from currentAccount: Account?, to targetAccount: Account) async throws {
         let keychain = KeychainService.shared
+        let relaySettings = RelaySettingsService.shared
 
-        log.info("[switchAccount] Switching from \(currentAccount.id) to \(targetAccount.id)")
+        log.info("[switchAccount] Switching from \(currentAccount?.id.uuidString ?? "none") to \(targetAccount.id) (relay=\(targetAccount.isRelay))")
 
-        // 1. Back up current account (token + oauthAccount)
-        log.info("[switchAccount] Step 1: Backing up current account...")
-        if let currentToken = keychain.readClaudeToken(),
-           let currentOAuth = keychain.readOAuthAccount() {
-            let email = (currentOAuth["emailAddress"]?.value as? String) ?? "?"
-            if email == currentAccount.email {
-                let saved = keychain.saveAccountBackup(token: currentToken, oauthAccount: currentOAuth, forAccountId: currentAccount.id.uuidString)
-                log.info("[switchAccount] Step 1: Backup saved: \(saved)")
+        // 1. Back up the current OFFICIAL account. Relay creds live only in the
+        //    vault and never drift, so there is nothing to capture when leaving a relay.
+        if let current = currentAccount, !current.isRelay {
+            if let currentToken = keychain.readClaudeToken(),
+               let currentOAuth = keychain.readOAuthAccount() {
+                let email = (currentOAuth["emailAddress"]?.value as? String) ?? "?"
+                if email == current.email {
+                    let saved = keychain.saveAccountBackup(token: currentToken, oauthAccount: currentOAuth, forAccountId: current.id.uuidString)
+                    log.info("[switchAccount] Step 1: Backup saved: \(saved)")
+                } else {
+                    log.warning("[switchAccount] Step 1: oauthAccount email (\(email)) != source (\(current.email)), skipping backup")
+                }
             } else {
-                log.warning("[switchAccount] Step 1: oauthAccount email (\(email)) != source (\(currentAccount.email)), skipping backup")
+                log.warning("[switchAccount] Step 1: Could not read current token or oauthAccount")
             }
-        } else {
-            log.warning("[switchAccount] Step 1: Could not read current token or oauthAccount")
         }
 
         // 2. Retrieve target account's backup
-        log.info("[switchAccount] Step 2: Reading backup for target account...")
         guard let targetBackup = keychain.getAccountBackup(forAccountId: targetAccount.id.uuidString) else {
             log.error("[switchAccount] Step 2: No backup found for target account!")
             throw ClaudeServiceError.noTokenForAccount(targetAccount.id.uuidString)
         }
-        let targetEmail = (targetBackup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
-        log.info("[switchAccount] Step 2: Target backup found (email=\(targetEmail))")
 
-        // 3. Snapshot current credentials for rollback, then write target
-        log.info("[switchAccount] Step 3: Writing target credentials...")
+        // 3. Snapshot ALL THREE slots for rollback (keychain token, oauthAccount, relay env)
         let rollbackToken = keychain.readClaudeToken()
         let rollbackOAuth = keychain.readOAuthAccount()
+        let rollbackRelay = relaySettings.readRelayEnv()
 
-        guard keychain.writeClaudeToken(targetBackup.token) else {
-            log.error("[switchAccount] Step 3: Failed to write token to keychain!")
-            throw ClaudeServiceError.keychainWriteFailed
+        func rollback() {
+            log.warning("[switchAccount] Rolling back all slots...")
+            if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) } else { _ = keychain.deleteClaudeToken() }
+            if let rollbackOAuth { _ = keychain.writeOAuthAccount(rollbackOAuth) } else { _ = keychain.removeOAuthAccount() }
+            _ = relaySettings.setRelayEnv(rollbackRelay)
         }
-        guard keychain.writeOAuthAccount(targetBackup.oauthAccount) else {
-            // Rollback: restore original token since oauthAccount write failed
-            log.error("[switchAccount] Step 3: Failed to write oauthAccount — rolling back token!")
-            if let rollbackToken {
-                _ = keychain.writeClaudeToken(rollbackToken)
+
+        if let relayInfo = targetBackup.relay {
+            // 4a. → Relay: env keys in, OAuth slots out (mutual exclusion — the OS
+            // layer expresses exactly one identity at any moment).
+            let target = RelayEnv(baseURL: relayInfo.baseURL, token: targetBackup.token)
+            guard relaySettings.writeRelayEnv(target) else {
+                rollback()
+                throw ClaudeServiceError.relayEnvWriteFailed
             }
-            if let rollbackOAuth {
-                _ = keychain.writeOAuthAccount(rollbackOAuth)
+            _ = keychain.deleteClaudeToken()
+            _ = keychain.removeOAuthAccount()
+
+            guard relaySettings.readRelayEnv() == target, keychain.readClaudeToken() == nil else {
+                rollback()
+                throw ClaudeServiceError.switchVerificationFailed
             }
-            throw ClaudeServiceError.oauthAccountWriteFailed
-        }
-        log.info("[switchAccount] Step 3: Both token and oauthAccount written")
+            log.info("[switchAccount] Relay switch verified: \(relayInfo.baseURL)")
+        } else {
+            // 4b. → Official: OAuth slots in, env keys out
+            guard keychain.writeClaudeToken(targetBackup.token) else {
+                log.error("[switchAccount] Failed to write token to keychain!")
+                rollback()
+                throw ClaudeServiceError.keychainWriteFailed
+            }
+            guard keychain.writeOAuthAccount(targetBackup.oauthAccount) else {
+                log.error("[switchAccount] Failed to write oauthAccount!")
+                rollback()
+                throw ClaudeServiceError.oauthAccountWriteFailed
+            }
+            guard relaySettings.clearRelayEnv() else {
+                log.error("[switchAccount] Failed to clear relay env keys!")
+                rollback()
+                throw ClaudeServiceError.relayEnvWriteFailed
+            }
 
-        // 4. Verify by reading back the OS slots — rollback on any mismatch.
-        // Reading our own writes is the strongest check available: the CLI's
-        // `auth status` reads exactly these two sources anyway.
-        log.info("[switchAccount] Step 4: Verifying OS slots...")
-        let status = getAuthStatus()
-        guard status.loggedIn else {
-            log.error("[switchAccount] Step 4: Not logged in after switch — rolling back keychain!")
-            if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) }
-            if let rollbackOAuth { _ = keychain.writeOAuthAccount(rollbackOAuth) }
-            throw ClaudeServiceError.switchVerificationFailed
+            // Verify by reading back the OS slots — rollback on any mismatch.
+            let status = getAuthStatus()
+            guard status.relayEnv == nil, status.loggedIn else {
+                log.error("[switchAccount] Not logged in after switch — rolling back!")
+                rollback()
+                throw ClaudeServiceError.switchVerificationFailed
+            }
+            guard status.email == targetAccount.email else {
+                log.error("[switchAccount] Logged in as \(status.email ?? "nil") instead of \(targetAccount.email) — rolling back!")
+                rollback()
+                throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: status.email ?? "unknown")
+            }
+            log.info("[switchAccount] Official switch verified — logged in as \(status.email ?? "")")
         }
-        if status.email != targetAccount.email {
-            log.error("[switchAccount] Step 4: Logged in as \(status.email ?? "nil") instead of \(targetAccount.email) — rolling back keychain!")
-            if let rollbackToken { _ = keychain.writeClaudeToken(rollbackToken) }
-            if let rollbackOAuth { _ = keychain.writeOAuthAccount(rollbackOAuth) }
-            throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: status.email ?? "unknown")
-        }
-        log.info("[switchAccount] Step 4: Switch verified — logged in as \(status.email ?? "")")
-
-        // (No re-capture step: nothing can mutate the keychain between our Step 3
-        // write and here now that verification doesn't fork the CLI — the vault
-        // already holds exactly what we just wrote.)
     }
 
     /// Capture the current Claude auth token + oauthAccount and associate with an account.
@@ -516,6 +579,7 @@ enum ClaudeServiceError: LocalizedError {
     case oauthAccountWriteFailed
     case switchVerificationFailed
     case switchWrongAccount(expected: String, actual: String)
+    case relayEnvWriteFailed
     case invalidAuthCode(String)
     case oauthExchangeFailed(String)
     case profileFetchFailed(String)
@@ -532,6 +596,8 @@ enum ClaudeServiceError: LocalizedError {
             return "Account switch verification failed"
         case .switchWrongAccount(let expected, let actual):
             return "Switch failed: expected \(expected) but got \(actual). Try removing and re-adding the account."
+        case .relayEnvWriteFailed:
+            return "Failed to update relay keys in ~/.claude/settings.json"
         case .invalidAuthCode(let msg):
             return "Invalid authorization code: \(msg)"
         case .oauthExchangeFailed(let msg):
