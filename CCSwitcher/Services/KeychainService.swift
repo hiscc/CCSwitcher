@@ -3,10 +3,19 @@ import Security
 
 private let log = FileLog("Keychain")
 
-/// Per-account backup: keychain token + oauthAccount from ~/.claude.json
+/// Relay-station identity stored alongside the token in a vault entry.
+/// nil on a backup = official OAuth account (legacy entries decode as nil — no migration).
+struct RelayInfo: Codable, Equatable {
+    let name: String
+    let baseURL: String
+}
+
+/// Per-account backup: keychain token + oauthAccount from ~/.claude.json.
+/// Relay entries reuse `token` for the relay API key and carry empty oauthAccount.
 struct AccountBackup: Codable {
     let token: String
     let oauthAccount: [String: AnyCodable]
+    var relay: RelayInfo? = nil
 }
 
 /// Type-erased Codable wrapper for heterogeneous JSON values.
