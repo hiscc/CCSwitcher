@@ -141,7 +141,14 @@ final class KeychainService: Sendable {
             "-s", claudeService,
             "-a", claudeAccount
         ])
-        let gone = readClaudeToken() == nil
+        // Probe via runSecurity directly — readClaudeToken() logs a scary ERROR when
+        // the item is (correctly) gone.
+        let gone = runSecurity(args: [
+            "find-generic-password",
+            "-s", claudeService,
+            "-a", claudeAccount,
+            "-w"
+        ]) == nil
         log.info("[deleteClaudeToken] gone=\(gone)")
         return gone
     }
@@ -233,6 +240,12 @@ final class KeychainService: Sendable {
         backupLock.lock()
         defer { backupLock.unlock() }
         var store = loadBackupStore()
+        // Symmetric guard to saveAccountBackup's relay-refusal: a relay write over an
+        // existing OFFICIAL entry would destroy OAuth credentials — refuse.
+        if let existing = store[accountId], existing.relay == nil {
+            log.error("[saveRelayBackup] REFUSED: \(accountId) is an official entry — will not overwrite OAuth credentials")
+            return false
+        }
         store[accountId] = AccountBackup(token: token, oauthAccount: [:], relay: relay)
         return saveBackupStore(store)
     }
