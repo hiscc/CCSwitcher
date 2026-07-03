@@ -542,7 +542,10 @@ final class AppState: ObservableObject {
     }
 
     func switchTo(_ account: Account) async {
-        guard !isLoading else {
+        // Reentrancy guard for MANUAL switches. Auto-switch runs inside
+        // performRefresh (isLoading == true by definition) — exempt it via
+        // isAutoSwitching, which autoSwitchIfNeeded sets before calling us.
+        guard !isLoading || isAutoSwitching else {
             log.info("[switchTo] Ignored: a switch/refresh is already in flight")
             errorMessage = "Busy refreshing — try again in a moment."
             return

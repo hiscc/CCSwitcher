@@ -8,7 +8,7 @@
 - settings.json 严格读-改-写：只动两键、其余键（hooks/permissions/plugins…）原样透传（含 Bool/数字/null/嵌套结构保真回归测试）、解析失败或 env 非对象拒绝写入；三槽位快照回滚，回滚失败可见化（switchRollbackFailed）
 - vault `AccountBackup` 增加可选 `relay` 字段（旧条目解码为 nil，零迁移）；saveAccountBackup/saveRelayBackup 双向拒绝跨类型覆写；active 派生优先匹配 relay env，不认识的 env 按「外部登录了不认识的账号」先例清 active 不冒认
 - 中转站不取用量（各站 API 非标）、不参与 auto-switch；用量页显示「Relay station — no usage data」，全 relay 配置下卡片列表正常渲染
-- switchTo 增加重入护栏（isLoading 期间忽略并提示）、active 为空时也可切换（此前 Switch 无效的隐性问题）
+- switchTo 增加重入护栏（isLoading 期间手动切换忽略并提示；auto-switch 内部调用豁免）、active 为空时也可切换（此前 Switch 无效的隐性问题）
 - 新建 `CCSwitcherTests` 纯逻辑测试 target（18 个测试：settings.json 读改写保键与保真、AccountBackup 新旧格式、baseURL 归一化边界）
 
 ### refactor: subscriptionType 改为从 vault 推导，消除最后一处双源
