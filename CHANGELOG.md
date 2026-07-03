@@ -2,6 +2,15 @@
 
 ## Unreleased (current working changes)
 
+### feat: 中转站（Relay）账号——baseURL + token 即可让 cc 走 Anthropic 兼容中转
+- 新增账号类型：名称 + baseURL + token 添加中转站，与官方 OAuth 账号同列表互切；「Test」按钮先探测 `{base}/v1/messages` 连通性与 token 有效性（校验 200 响应体为 Anthropic message、自动剥用户误填的尾缀 `/v1`）
+- 互斥式切换：切到中转站 = `~/.claude/settings.json` env 写 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` 两键 + 清 keychain token 与 `~/.claude.json` oauthAccount；切回官方反向。OS 层任意时刻只表达一个身份，不依赖 cc 未文档化的 env/OAuth 优先级（机制已实测：env 在场时 `claude -p` 假 token 得 401，不回落 OAuth）
+- settings.json 严格读-改-写：只动两键、其余键（hooks/permissions/plugins…）原样透传（含 Bool/数字/null/嵌套结构保真回归测试）、解析失败或 env 非对象拒绝写入；三槽位快照回滚，回滚失败可见化（switchRollbackFailed）
+- vault `AccountBackup` 增加可选 `relay` 字段（旧条目解码为 nil，零迁移）；saveAccountBackup/saveRelayBackup 双向拒绝跨类型覆写；active 派生优先匹配 relay env，不认识的 env 按「外部登录了不认识的账号」先例清 active 不冒认
+- 中转站不取用量（各站 API 非标）、不参与 auto-switch；用量页显示「Relay station — no usage data」，全 relay 配置下卡片列表正常渲染
+- switchTo 增加重入护栏（isLoading 期间忽略并提示）、active 为空时也可切换（此前 Switch 无效的隐性问题）
+- 新建 `CCSwitcherTests` 纯逻辑测试 target（18 个测试：settings.json 读改写保键与保真、AccountBackup 新旧格式、baseURL 归一化边界）
+
 ### refactor: subscriptionType 改为从 vault 推导，消除最后一处双源
 - `reconcileAccountsWithVault` 此前"保留"UserDefaults 里的 subscriptionType（注释称 vault 没有该字段——已过时：vault 的 token JSON 一直带 subscriptionType）。现在用 `extractSubscriptionType(backup.token)` 推导，vault 成为属主；仅当老 token JSON 缺字段时回退保留旧值
 - 至此 UserDefaults 中只剩 `lastUsed` 一个非派生字段，其余全部由 vault/OS 槽位单向推导
