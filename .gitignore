@@ -23,3 +23,6 @@ CCSwitcher/Info.plist
 
 # XcodeGen generated project
 CCSwitcher.xcodeproj/
+
+# Local git worktrees
+.worktrees/
