@@ -10,6 +10,12 @@ final class UpdateChecker: ObservableObject {
     @Published var latestVersion = ""
     @Published var releaseURL: URL?
 
+    private let session: URLSession
+
+    init(session: URLSession = PinnedProxySession.shared) {
+        self.session = session
+    }
+
     // GitHub repository details
     private let owner = "XueshiQiao"
     private let repo = "CCSwitcher"
@@ -41,7 +47,7 @@ final class UpdateChecker: ObservableObject {
                 var request = URLRequest(url: url)
                 request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
                 
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await session.data(for: request)
                 
                 guard let httpResponse = response as? HTTPURLResponse else {
                     if manual {
@@ -172,7 +178,7 @@ final class UpdateChecker: ObservableObject {
         
         do {
             // Download the file
-            let (tempURL, response) = try await URLSession.shared.download(from: url)
+            let (tempURL, response) = try await session.download(from: url)
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                 throw URLError(.badServerResponse)
             }

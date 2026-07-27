@@ -12,7 +12,11 @@ private let log = FileLog("Claude")
 final class ClaudeService: @unchecked Sendable {
     static let shared = ClaudeService()
 
-    private init() {}
+    private let session: URLSession
+
+    private init(session: URLSession = PinnedProxySession.shared) {
+        self.session = session
+    }
 
     // MARK: - Auth Status
 
@@ -66,7 +70,7 @@ final class ClaudeService: @unchecked Sendable {
 
         log.debug("[getUsageLimits] REQUEST URL: \(url.absoluteString)")
 
-        let (responseData, response) = try await URLSession.shared.data(for: request)
+        let (responseData, response) = try await session.data(for: request)
         let httpResponse = response as? HTTPURLResponse
         guard httpResponse?.statusCode == 200 else {
             let responseString = String(data: responseData, encoding: .utf8) ?? ""
@@ -164,7 +168,7 @@ final class ClaudeService: @unchecked Sendable {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else {
                 log.error("[refreshToken] No HTTP response")
                 return nil
@@ -234,7 +238,7 @@ final class ClaudeService: @unchecked Sendable {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             let snippet = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
             log.info("[testRelay] \(baseURL) → HTTP \(code)")
@@ -462,7 +466,7 @@ final class ClaudeService: @unchecked Sendable {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let resp = String(data: data, encoding: .utf8) ?? ""
@@ -482,7 +486,7 @@ final class ClaudeService: @unchecked Sendable {
         var profileReq = URLRequest(url: Self.oauthProfileURL)
         profileReq.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         profileReq.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        let (profData, profResp) = try await URLSession.shared.data(for: profileReq)
+        let (profData, profResp) = try await session.data(for: profileReq)
         guard (profResp as? HTTPURLResponse)?.statusCode == 200,
               let profile = try JSONSerialization.jsonObject(with: profData) as? [String: Any],
               let account = profile["account"] as? [String: Any],
