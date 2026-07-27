@@ -55,6 +55,7 @@ targets:
       - path: CCSwitcher/Services/RelaySettingsService.swift
       - path: CCSwitcher/Services/KeychainService.swift
       - path: CCSwitcher/Services/FileLogger.swift
+      - path: CCSwitcher/Services/PinnedProxySession.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: me.xueshi.ccswitcher.tests
