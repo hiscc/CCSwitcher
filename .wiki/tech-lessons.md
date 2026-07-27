@@ -166,3 +166,22 @@ md5 -q /Applications/CCSwitcher.app/Contents/MacOS/CCSwitcher
 ——
 
 来源:2026-06-11 与用户调试登录失败。证据:CCSwitcher.log 05:43–06:57 段、ps/lsof 僵尸进程取证、claude auth login 对照实验(/tmp/loginA.out、/tmp/loginB.out)。
+
+## 7. 系统代理继承不等于 fail-closed(2026-07-27)
+
+### 边界
+
+`URLSession.shared` 正常情况下会跟随 macOS 系统代理,但这只描述代理存在时的路由。代理客户端退出并恢复系统网络后,新的 GUI 请求可直接访问目标;目标域名规则只有请求先进入代理内核后才会生效。因此账号查询、OAuth/Token 刷新等敏感请求不能只依赖系统代理状态。
+
+### 已实施结构
+
+- 所有 CCSwitcher 自有 HTTP(S) 请求共用 `PinnedProxySession`。
+- `connectionProxyDictionary` 将 HTTP/HTTPS 显式固定为 `127.0.0.1:7890`。
+- 业务层 401/429 重试复用同一会话,禁止创建 `URLSession.shared` 或无代理会话兜底。
+- 生产源码用 `rg 'URLSession\.shared' CCSwitcher --glob '*.swift'` 守卫,预期零命中。
+
+### 故障验证事实
+
+把测试会话固定到无人监听的 `127.0.0.1:1` 后,CFNetwork 只尝试该 loopback 端口并返回 `proxy error`;请求没有直连 `example.com`。该错误在当前 SDK 中表现为 `NSError(kCFErrorDomainCFNetwork, 310)`,不一定能桥接为 `URLError`,所以回归测试应验证“请求没有成功”,不要把具体错误类型当安全不变量。
+
+来源:2026-07-27 强制代理改造。证据:`PinnedProxySessionTests.testUnavailableProxyDoesNotFallBackToDirect` 的 Network.framework 日志与全量测试。

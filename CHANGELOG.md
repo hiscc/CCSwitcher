@@ -2,6 +2,10 @@
 
 ## Unreleased (current working changes)
 
+### security: 所有应用内 HTTP(S) 请求强制走 127.0.0.1:7890
+- 新增统一 `PinnedProxySession`，用量查询、OAuth/Token 刷新、账号资料、中转站测试、GitHub 更新检查和下载全部显式绑定 XPro mixed-port；不再依赖会随代理退出而消失的 macOS 系统代理状态
+- 本地 7890 不可用时请求报错或超时，不创建默认 `URLSession` 重试、不回退 DIRECT；新增 HTTP/HTTPS 代理字典和 dead-port 回归测试
+
 ### feat: 中转站（Relay）账号——baseURL + token 即可让 cc 走 Anthropic 兼容中转
 - 新增账号类型：名称 + baseURL + token 添加中转站，与官方 OAuth 账号同列表互切；「Test」按钮先探测 `{base}/v1/messages` 连通性与 token 有效性（校验 200 响应体为 Anthropic message、自动剥用户误填的尾缀 `/v1`）
 - 互斥式切换：切到中转站 = `~/.claude/settings.json` env 写 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` 两键 + 清 keychain token 与 `~/.claude.json` oauthAccount；切回官方反向。OS 层任意时刻只表达一个身份，不依赖 cc 未文档化的 env/OAuth 优先级（机制已实测：env 在场时 `claude -p` 假 token 得 401，不回落 OAuth）
